@@ -44,7 +44,7 @@ export async function createBridge(options={}) {
   const idleMs=options.idleMs ?? bounded(process.env.NOVA_BRIDGE_IDLE_MINUTES,20,1,120)*60*1000,ttlMs=options.ttlMs ?? 6*60*60*1000;
   const ffmpeg=options.ffmpeg || process.env.NOVA_FFMPEG || ffmpegStatic;
   const origins=new Set(options.origins || (process.env.NOVA_ALLOWED_ORIGINS || 'https://nova-cinema-eduar.eduardochiana25.chatgpt.site').split(',').map(s=>s.trim()));
-  const packs=new Map(),packSources=new Map(),probeCache=new Map(),preparations=new Map();
+  const packs=new Map(),packSources=new Map(),probeCache=new Map(),preparations=new Map(),cancelledPreparations=new Map();
   const bootId=randomBytes(8).toString('hex'),startedAt=Date.now();
   const sessions=new Map(),torrents=new Map(),jobs=new JobQueue(bounded(options.concurrency ?? process.env.NOVA_BRIDGE_JOBS,2,1,16));
   const client=options.client || new WebTorrent({maxConns:50,lsd:false,natUpnp:false,natPmp:false,webSeeds:true,blocklist:PRIVATE_RANGES,uploadLimit:512*1024});
@@ -90,7 +90,7 @@ export async function createBridge(options={}) {
     const target=path.resolve(root,'sessions',p.id);if(!target.startsWith(root+path.sep))throw Error('Invalid cache path');await rm(target,{recursive:true,force:true});
   }
   async function prunePacks(){
-    const limit=options.packCacheBytes ?? 256*1024**2;
+    const limit=options.packCacheBytes ?? bounded(process.env.NOVA_BRIDGE_PACK_CACHE_MB,256,32,2048)*1024**2;
     let bytes=[...packs.values()].reduce((n,p)=>n+p.segmentBytes+[...p.copies.values()].reduce((v,e)=>v+(e.info?.size||0),0),0);
     for(const p of [...packs.values()].sort((a,b)=>a.used-b.used)){
       if(!p.users.size && (Date.now()-p.used>120000 || bytes>limit)){bytes-=p.segmentBytes+[...p.copies.values()].reduce((n,e)=>n+(e.info?.size||0),0);await disposePack(p);continue;}
@@ -121,6 +121,7 @@ export async function createBridge(options={}) {
     const request=sourceRequest(value),owner=String(value.owner || '');
     if(!/^[a-f0-9]{64}$/.test(owner))throw new BridgeError('Missing trusted viewer identifier.',403);
     const ticket=/^[a-f0-9-]{36}$/.test(value.requestId||'')?value.requestId:null;const phase=(name)=>{if(ticket)preparations.set(owner+':'+ticket,{phase:name,updated:Date.now()});};phase('metadata');
+    if(ticket && cancelledPreparations.has(owner+':'+ticket))throw new BridgeError('Preparation was cancelled.',410);
     memoryAvailable();if(sessions.size>=maxSessions)throw new BridgeError('The bridge has reached its configured playback capacity.',429);
     // Reserve before awaiting metadata, so parallel requests cannot evade limits.
     const s={id:randomBytes(16).toString('hex'),token:randomBytes(24).toString('hex'),rawToken:randomBytes(24).toString('hex'),owner,requestId:ticket,infoHash:request.infoHash,used:Date.now(),expires:Date.now()+ttlMs,file:null,info:null,segmentBytes:0,batches:new Map(),completedBatches:new Map(),segmentReaders:new Map(),copies:new Map(),copyBatches:new Set(),copyReaders:new Map(),children:new Set(),readers:new Set(),error:'',disposing:false};
@@ -134,7 +135,7 @@ export async function createBridge(options={}) {
       const state=torrents.get(request.infoHash);
       phase('index');const probeKey=request.infoHash+':'+chosen.index;const cached=probeCache.get(probeKey);let info=state.probes.get(chosen.index) || (cached && Date.now()-cached.used<1800000 ? Promise.resolve(cached.info):null);
       if(!info){info=jobs.run(async()=>{const metadata=await probe(s.input,ffmpeg,options.probeTimeout || 90000);if(!metadata.dolbyVision && ((metadata.codec==='h264' && /^(yuv420p|yuvj420p)$/.test(metadata.pixelFormat)) || (metadata.codec==='hevc' && /^(yuv420p|yuv420p10le)$/.test(metadata.pixelFormat)))){const index=await matroskaIndex(s.file,metadata.duration);const codec=index && codecString(metadata.codec,index.privateData);if(codec)metadata.copy={segments:index.segments,codec};}return metadata;}).catch(e=>{state.probes.delete(chosen.index);probeCache.delete(probeKey);throw e;});state.probes.set(chosen.index,info);}
-      s.info=await info;if(closing || s.disposing)throw new BridgeError('Preparation was cancelled.',410);s.file=chosen.file;probeCache.delete(probeKey);probeCache.set(probeKey,{info:s.info,used:Date.now()});if(probeCache.size>64)probeCache.delete(probeCache.keys().next().value);
+      s.info=await info;if(closing || s.disposing || ticket && cancelledPreparations.has(owner+':'+ticket))throw new BridgeError('Preparation was cancelled.',410);s.file=chosen.file;probeCache.delete(probeKey);probeCache.set(probeKey,{info:s.info,used:Date.now()});if(probeCache.size>64)probeCache.delete(probeCache.keys().next().value);
       const packKey=probeKey;let pack=packs.get(packKey);
       if(!pack){pack={...s,id:randomBytes(16).toString('hex'),rawToken:randomBytes(24).toString('hex'),readers:new Set(),key:packKey,users:new Set(),work:new Map(),readahead:60};pack.input='http://127.0.0.1:'+rawPort+'/raw/'+pack.id+'/'+pack.rawToken;packs.set(packKey,pack);packSources.set(pack.id,pack);}
       pack.used=Date.now();pack.users.add(s.id);s.pack=pack;s.active=true;s.input=pack.input;
@@ -212,7 +213,7 @@ export async function createBridge(options={}) {
         const disk=await statfs(root);json(res,200,{memoryBytes:process.memoryUsage().rss,memoryBudget:maxRss,pieceBytes:pieceCache.bytes,pieceBudget:cacheBytes,packBytes:[...packs.values()].reduce((n,p)=>n+p.segmentBytes+[...p.copies.values()].reduce((v,e)=>v+(e.info?.size||0),0),0),sessions:sessions.size,torrents:torrents.size,packs:packs.size,queue:jobs.pending.length,running:jobs.running,uptime:process.uptime(),warm:warm.state,freeHours:null,transferRemaining:null});return;
       }
       if(url.pathname==='/v1/preparation' && req.method==='POST'){
-        if(!equal(req.headers.authorization,'Bearer '+secret))throw new BridgeError('Not authorized.',401);const value=await readBody(req),key=value.owner+':'+value.requestId,entry=preparations.get(key);if(value.cancel){const owned=[...sessions.values()].find(s=>s.requestId===value.requestId && equal(s.owner,value.owner));if(owned)await dispose(owned);preparations.delete(key);}json(res,200,{phase:entry?.phase || 'connecting'});return;
+        if(!equal(req.headers.authorization,'Bearer '+secret))throw new BridgeError('Not authorized.',401);const value=await readBody(req),key=value.owner+':'+value.requestId,entry=preparations.get(key);if(value.cancel){cancelledPreparations.set(key,Date.now());const owned=[...sessions.values()].find(s=>s.requestId===value.requestId && equal(s.owner,value.owner));if(owned)await dispose(owned);preparations.delete(key);}json(res,200,{phase:entry?.phase || 'connecting'});return;
       }
       const statusSession=/^\/v1\/sessions\/([a-f0-9]{32})\/status$/.exec(url.pathname);
       if(statusSession && req.method==='POST'){
@@ -284,7 +285,7 @@ export async function createBridge(options={}) {
     } catch(e){options.onError?.(e);if(!res.headersSent)json(res,e instanceof BridgeError?e.status:500,{error:e instanceof BridgeError?e.message:'The playback bridge failed. Try another source.'});else res.destroy();}
   });
   server.requestTimeout=300000;server.headersTimeout=30000;
-  const timer=setInterval(()=>{prunePacks().catch(()=>{});for(const [key,value] of preparations)if(Date.now()-value.updated>300000)preparations.delete(key);for(const [key,value] of probeCache)if(Date.now()-value.used>1800000)probeCache.delete(key);for(const s of sessions.values())if(Date.now()-s.used>idleMs || Date.now()>s.expires)dispose(s).catch(()=>{});for(const [hash,state] of torrents)if(Date.now()-state.used>120000 && ![...sessions.values()].some(s=>s.infoHash===hash) && ![...packs.values()].some(p=>p.infoHash===hash && !p.disposing)){torrents.delete(hash);client.remove(hash,{destroyStore:true}).catch(()=>{});}},30000);timer.unref();
+  const timer=setInterval(()=>{prunePacks().catch(()=>{});for(const [key,time] of cancelledPreparations)if(Date.now()-time>300000)cancelledPreparations.delete(key);for(const [key,value] of preparations)if(Date.now()-value.updated>300000)preparations.delete(key);for(const [key,value] of probeCache)if(Date.now()-value.used>1800000)probeCache.delete(key);for(const s of sessions.values())if(Date.now()-s.used>idleMs || Date.now()>s.expires)dispose(s).catch(()=>{});for(const [hash,state] of torrents)if(Date.now()-state.used>120000 && ![...sessions.values()].some(s=>s.infoHash===hash) && ![...packs.values()].some(p=>p.infoHash===hash && !p.disposing)){torrents.delete(hash);client.remove(hash,{destroyStore:true}).catch(()=>{});}},30000);timer.unref();
   return {server,sessions,client,pieceCache,packs,jobs,async close(){closing=true;warm.stop();clearInterval(timer);await Promise.allSettled([...sessions.values()].map(dispose));await Promise.allSettled([...packs.values()].map(disposePack));await new Promise(resolve=>client.destroy(resolve));await new Promise(resolve=>raw.close(resolve));if(server.listening)await new Promise(resolve=>{server.close(resolve);server.closeAllConnections();});}};
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
