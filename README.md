@@ -16,6 +16,8 @@ There is no fixed movie-file size ceiling. A shared rolling disk cache retains r
 
 Piece reads allocate only the requested byte range, including the small blocks used by peer uploads. Queued uploads do not retain entire multi-megabyte pieces. A regression checks both byte identity and bounded retained allocation for a 16 KB request from a 2 MB piece.
 
+Browser byte probes are also bounded. WebTorrent's zero-end sentinel is normalized before reading, and the wrapper trims each requested window. A `bytes=0-0` request returns exactly one byte without accidentally selecting the entire movie for download.
+
 This server does not supply movie licenses, peers, translations or an exhaustive catalog. Use media you have permission to stream. Torrent availability and the host's resources still determine whether a source plays. The software is free and contains no advertising. Hosting has separate resource policies: Render's free plan sleeps, shares compute, has monthly transfer limits, and may suspend high-volume outbound traffic. It cannot provide unlimited public streaming. No paid plan is configured.
 
 Render Hobby currently includes 5 GB of outbound bandwidth per workspace per month. Without a saved payment method, exceeding the allowance suspends free services instead of billing overages. If a payment method is added later, usage can generate charges. There is no mechanism in NOVA that upgrades hosting, buys credits or starts paid subscriptions. Account-level allowances include other services and cannot be inferred from NOVA's cache size. Check https://render.com/docs/outbound-bandwidth and https://render.com/docs/free before changing billing or interpreting the free plan as unlimited.

@@ -932,7 +932,7 @@ export async function createBridge(options = {}) {
         json(res, 200, {
           status: "ok",
           protocol: 1,
-          version: "4.6.1",
+          version: "4.6.2",
           bootId,
           startedAt,
           warm: warm.state,
