@@ -50,6 +50,7 @@ export function masterPlaylist(qualities,audio,width,height) {
   return rows.concat('').join('\n');
 }
 export function originalPlayable(file,info){
+  if(info.dolbyVision)return false;
   if(!/\.(mp4|m4v)$/i.test(file.name))return false;
   const video=info.codec==='h264' && /^(yuv420p|yuvj420p)$/.test(info.pixelFormat || '') || info.codec==='hevc' && info.codecTag==='hvc1' && /^(yuv420p|yuv420p10le)$/.test(info.pixelFormat || '');
   // The unchanged file plays its default audio stream. Other languages remain

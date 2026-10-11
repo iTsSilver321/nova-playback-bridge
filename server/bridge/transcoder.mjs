@@ -20,7 +20,7 @@ export async function probe(input,ffmpeg,timeout=90000) {
       if(!video || duration<=0 || duration>86400) return done(new BridgeError('This video has no supported finite timeline. Try another source.',422));
       const audio=[...output.matchAll(/Stream #0:(\d+)(?:\[.*?\])?(?:\(([^)]+)\))?[^\n]*Audio:\s*([^,\n]+)/g)].map(m=>({id:Number(m[1]),lang:m[2]||'und',default:output.slice(m.index,output.indexOf('\n',m.index)).includes('(default)'),codec:m[3].trim().split(/[ (]/)[0],name:(m[2]||'Original')+' · '+m[3].trim()}));
       const line=output.split('\n').find(s=>s.includes('Video:')) || '';
-      done(null,{duration,width:Number(video[2]),height:Number(video[3]),codec:video[1],dolbyVision:/DOVI configuration/i.test(output),codecTag:/\((avc1|hvc1|hev1)\s*\//.exec(line)?.[1] || '',pixelFormat:/\b(yuvj?\d+p(?:\d+le)?)(?:\(|,| )/.exec(line)?.[1] || '',audio});
+      done(null,{duration,width:Number(video[2]),height:Number(video[3]),codec:video[1],fps:Number(/([\d.]+) fps/.exec(line)?.[1] || 24),hdr:/bt2020|smpte2084|arib-std-b67/i.test(line),dolbyVision:/DOVI configuration/i.test(output),codecTag:/\((avc1|hvc1|hev1)\s*\//.exec(line)?.[1] || '',pixelFormat:/\b(yuvj?\d+p(?:\d+le)?)(?:\(|,| )/.exec(line)?.[1] || '',audio});
     });
   });
 }
@@ -92,11 +92,12 @@ export async function remuxBatch({ffmpeg,input,directory,segments,codec,audio,au
 }
 export class JobQueue {
   constructor(concurrency=2,maxPending=16){this.concurrency=concurrency;this.maxPending=maxPending;this.running=0;this.pending=[];}
-  run(work) {
+  run(work,signal) {
+    if(signal?.aborted)return Promise.reject(new BridgeError('Obsolete playback work cancelled.',410));
     if(this.pending.length>=this.maxPending)return Promise.reject(new BridgeError('The bridge is busy. Retry shortly.',503));
-    return new Promise((resolve,reject)=>{this.pending.push({work,resolve,reject});this.drain();});
+    return new Promise((resolve,reject)=>{const item={work,resolve,reject,signal,cancel:null};item.cancel=()=>{const index=this.pending.indexOf(item);if(index>=0){this.pending.splice(index,1);reject(new BridgeError('Obsolete playback work cancelled.',410));}};signal?.addEventListener('abort',item.cancel,{once:true});this.pending.push(item);this.drain();});
   }
-  drain(){while(this.running<this.concurrency && this.pending.length){const item=this.pending.shift();this.running++;Promise.resolve().then(item.work).then(item.resolve,item.reject).finally(()=>{this.running--;this.drain();});}}
+  drain(){while(this.running<this.concurrency && this.pending.length){const item=this.pending.shift();item.signal?.removeEventListener('abort',item.cancel);if(item.signal?.aborted){item.reject(new BridgeError('Obsolete playback work cancelled.',410));continue;}this.running++;Promise.resolve().then(item.work).then(item.resolve,item.reject).finally(()=>{this.running--;this.drain();});}}
 }
 export async function encodeBatch({ffmpeg,input,directory,batch,quality,audio,duration,threads=2,preset='veryfast',timeout=180000,onChild}) {
   await mkdir(directory,{recursive:true});
