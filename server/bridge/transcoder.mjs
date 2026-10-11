@@ -1,5 +1,7 @@
 import {spawn} from 'node:child_process';
-import {mkdir,stat,open,writeFile,rename} from 'node:fs/promises';
+import {mkdir,stat,open,writeFile,rename,rm} from 'node:fs/promises';
+import {createReadStream,createWriteStream} from 'node:fs';
+import {pipeline} from 'node:stream/promises';
 import path from 'node:path';
 import {BridgeError,SEGMENT_SECONDS,BATCH_SEGMENTS} from './protocol.mjs';
 import {videoTrack,fragmentVideoTime} from './mp4-fragments.mjs';
@@ -48,6 +50,45 @@ export async function remuxSegment({ffmpeg,input,directory,index,start,duration,
   await rename(temporary,path.join(directory,`copy-segment-${index}.m4s`));await rename(path.join(directory,`copy-init-${index}.tmp`),path.join(directory,`copy-init-${index}.mp4`));
   const size=(await stat(path.join(directory,`copy-segment-${index}.m4s`))).size;
   return {offset:split,length:size-split,size};
+}
+export async function remuxBatch({ffmpeg,input,directory,segments,codec,audio,audioCopy,onChild,onSegment,timeout=90000}){
+  await mkdir(directory,{recursive:true});const start=segments[0].start,end=segments.at(-1).start+segments.at(-1).duration,temporary=path.join(directory,`batch-copy-${segments[0].index}.tmp.mp4`);
+  const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','1','-analyzeduration','500000','-probesize','524288','-seek2any','1','-ss',String(start),'-i',input,'-t',String(end-start),'-map','0:v:0','-c:v','copy','-tag:v',codec==='hevc'?'hvc1':'avc1','-sn','-dn'];
+  if(audio<0)args.push('-an');else{args.push('-map',`0:${audio}`,'-c:a',audioCopy?'copy':'aac');if(!audioCopy)args.push('-profile:a','aac_low','-ac','2','-ar','48000','-b:a','160k','-threads:a','1');}
+  args.push('-avoid_negative_ts','make_zero','-movflags','frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets','-f','mp4',temporary);
+  let done=false,failure,position=0,init,track,first,groupStart,current=0;
+  const child=spawn(ffmpeg,args,{windowsHide:true,stdio:['ignore','ignore','pipe']});onChild?.(child);
+  // Drain diagnostics without retaining packet data or private input URLs.
+  child.stderr.resume();const timer=setTimeout(()=>child.kill(),timeout);
+  const completion=new Promise(resolve=>{child.once('error',()=>{failure=new BridgeError('The video packager could not start.',503);done=true;resolve();});child.once('close',code=>{if(code!==0)failure=new BridgeError('Video packaging stalled. Try another source.',502);done=true;clearTimeout(timer);onChild?.(null);resolve();});});
+  const publish=async stop=>{
+    const segment=segments[current],file=path.join(directory,`copy-segment-${segment.index}.m4s`),pending=file+'.tmp';
+    await writeFile(pending,init);await pipeline(createReadStream(temporary,{start:groupStart,end:stop-1}),createWriteStream(pending,{flags:'a'}));await rename(pending,file);await writeFile(path.join(directory,`copy-init-${segment.index}.mp4`),init);
+    await onSegment(segment.index,{offset:init.length,length:stop-groupStart,size:init.length+stop-groupStart});current++;groupStart=stop;
+  };
+  try{
+    for(;;){
+      if(failure)throw failure;let length=0;try{length=(await stat(temporary)).size;}catch(e){if(e.code!=='ENOENT')throw e;}
+      if(length>position){const file=await open(temporary,'r');try{
+        const header=Buffer.alloc(16);
+        while(position+8<=length){
+          const read=await file.read(header,0,16,position);if(read.bytesRead<8)break;const type=header.toString('ascii',4,8),size=header.readUInt32BE(0)===1?Number(header.readBigUInt64BE(8)):header.readUInt32BE(0);
+          if(!size||position+size>length)break;if(size<8||!Number.isSafeInteger(size))throw new BridgeError('Invalid video fragment.',422);
+          if(type==='moof'){
+            if(!init){if(position>1024**2)throw new BridgeError('Oversized video initialization.',422);init=Buffer.alloc(position);await file.read(init,0,init.length,0);track=videoTrack(init);groupStart=position;}
+            if(size>1024**2)throw new BridgeError('Oversized fragment metadata.',422);const fragment=Buffer.alloc(size);await file.read(fragment,0,size,position);const timing=fragmentVideoTime(fragment,track);
+            if(timing){if(first===undefined){if(!timing.keyframe)throw new BridgeError('The source did not seek to a keyframe.',422);first=timing.pts;}
+              else if(current<segments.length && timing.pts-first>=segments[current].start+segments[current].duration-start-0.01){await publish(position);if(current===segments.length)break;}}
+          }
+          position+=size;
+        }
+      }finally{await file.close();}}
+      if(current===segments.length)break;
+      if(done){if(!init||first===undefined||position!==length)throw new BridgeError('The source returned incomplete video.',422);await publish(length);if(current!==segments.length)throw new BridgeError('The source has incomplete seek boundaries.',422);break;}
+      await new Promise(resolve=>setTimeout(resolve,40));
+    }
+    await completion;if(failure)throw failure;
+  }finally{clearTimeout(timer);if(!done)child.kill();await completion;await rm(temporary,{force:true});}
 }
 export class JobQueue {
   constructor(concurrency=2,maxPending=16){this.concurrency=concurrency;this.maxPending=maxPending;this.running=0;this.pending=[];}
