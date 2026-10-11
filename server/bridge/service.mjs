@@ -25,6 +25,7 @@ import {
   viewingStream,
 } from "./rolling-store.mjs";
 import { matroskaIndex, codecString } from "./matroska.mjs";
+import { mp4Metadata } from "./mp4-metadata.mjs";
 import { startWarmWatchdog } from "./warm-watchdog.mjs";
 
 const TRACKERS = [
@@ -500,8 +501,12 @@ export async function createBridge(options = {}) {
           ? Promise.resolve(cached.info)
           : null);
       if (!info) {
-        info = jobs
-          .run(async () => {
+        // A compatible MP4 needs no decoder or converter slot to describe it.
+        // Unknown, malformed, HDR and other formats still use the existing probe.
+        info = (async () => {
+          const direct = await mp4Metadata(s.file);
+          if (direct) return direct;
+          return jobs.run(async () => {
             const metadata = await probe(
               s.input,
               ffmpeg,
@@ -519,8 +524,9 @@ export async function createBridge(options = {}) {
                 index && codecString(metadata.codec, index.privateData);
               if (codec) metadata.copy = { segments: index.segments, codec };
             }
-            return metadata;
-          })
+            return { ...metadata, metadataMethod: "ffmpeg" };
+          });
+        })()
           .catch((e) => {
             state.probes.delete(chosen.index);
             probeCache.delete(probeKey);
@@ -599,6 +605,7 @@ export async function createBridge(options = {}) {
         fps: s.info.fps,
         hdr: !!s.info.hdr,
         dolbyVision: !!s.info.dolbyVision,
+        metadataMethod: s.info.metadataMethod,
         ...(s.info.copy
           ? {
               copy: {
@@ -616,6 +623,7 @@ export async function createBridge(options = {}) {
                 height: s.info.height,
                 width: s.info.width,
                 codec: s.info.codec,
+                codecString: s.info.codecString,
                 audioId: originalAudio,
               },
             }
@@ -909,7 +917,7 @@ export async function createBridge(options = {}) {
         json(res, 200, {
           status: "ok",
           protocol: 1,
-          version: "4.5.0",
+          version: "4.6.0",
           bootId,
           startedAt,
           warm: warm.state,

@@ -75,15 +75,21 @@ export class RollingPieceStore {
     this.pool.run(async()=>{for(const [key,e] of this.pool.entries)if(e.store===this){this.pool.entries.delete(key);this.pool.bytes-=e.bytes;}await this.ready;await rm(this.root,{recursive:true,force:true});}).then(()=>cb(null),cb);
   }
 }
-export function viewingStream(file,{start=0,end=file.length-1}={}){
+export function viewingStream(file,{start=0,end=file.length-1,signal}={}){
   const t=file._torrent,store=t.store.store,pool=store.pool;
-  if(!pool)return file.createReadStream({start,end});
+  const read=(start,end)=>{
+    if(signal?.aborted)throw Error('Movie read cancelled.');
+    const reader=file.createReadStream({start,end});
+    if(signal){const abort=()=>reader.destroy(Error('Movie read cancelled.'));signal.addEventListener('abort',abort,{once:true});reader.once('close',()=>signal.removeEventListener('abort',abort));}
+    return reader;
+  };
+  if(!pool)return read(start,end);
   const window=Math.max(t.pieceLength,Math.min(8*1024**2,Math.floor(pool.maxBytes/8)));
   return Readable.from((async function*(){
     for(let offset=start;offset<=end;offset+=window){
       const last=Math.min(end,offset+window-1),release=store.lease(Math.floor((file.offset+offset)/t.pieceLength),Math.floor((file.offset+last)/t.pieceLength));
-      const reader=file.createReadStream({start:offset,end:last});
-      try{for await(const bytes of reader)yield bytes;}finally{reader.destroy();release();}
+      let reader;
+      try{reader=read(offset,last);for await(const bytes of reader)yield bytes;}finally{reader?.destroy();release();}
     }
   })());
 }
