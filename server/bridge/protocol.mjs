@@ -12,7 +12,7 @@ export function sourceRequest(value) {
   if (episode !== undefined && (!Number.isInteger(episode.season) || !Number.isInteger(episode.episode) || episode.season < 0 || episode.episode < 1)) throw new BridgeError('Invalid episode.');
   return {infoHash:value.infoHash.toLowerCase(), fileIdx:index ?? undefined, episode};
 }
-export function selectVideo(files, request, maxBytes) {
+export function selectVideo(files, request, maxBytes=Infinity) {
   const videos = files.map((file,index)=>({file,index})).filter(({file})=>/\.(mp4|mkv|webm|m4v|mov|avi|ts)$/i.test(file.name));
   let chosen;
   if (request.fileIdx !== undefined) chosen=videos.find(v=>v.index===request.fileIdx);
@@ -23,6 +23,7 @@ export function selectVideo(files, request, maxBytes) {
     if (!chosen) throw new BridgeError('Choose an episode-specific torrent source. This season pack has no matching episode filename.',422);
   } else chosen=videos.filter(({file})=>!/(?:^|[ ._-])sample[ ._-]/i.test(file.name)).sort((a,b)=>b.file.length-a.file.length)[0];
   if(!chosen) throw new BridgeError('No matching video file in this source.',422);
+  if(!Number.isSafeInteger(chosen.file.length) || chosen.file.length<=0)throw new BridgeError('Invalid source file length.',422);
   if(chosen.file.length>maxBytes) throw new BridgeError('This source exceeds the bridge disk budget. Choose a smaller release.',413);
   return chosen;
 }

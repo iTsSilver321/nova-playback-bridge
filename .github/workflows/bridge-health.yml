@@ -1,0 +1,32 @@
+name: NOVA bridge health
+on:
+  schedule:
+    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: nova-bridge-health
+  cancel-in-progress: true
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Check and warm the free playback service
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, time, urllib.request
+          url = 'https://nova-playback-bridge.onrender.com/health'
+          for attempt in range(8):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      result = json.load(response)
+                  assert result.get('status') == 'ok' and result.get('protocol') == 1
+                  print('NOVA playback bridge is healthy; warm check completed.')
+                  break
+              except Exception:
+                  if attempt == 7:
+                      raise SystemExit('NOVA playback bridge did not become ready.')
+                  time.sleep(8)
+          PY

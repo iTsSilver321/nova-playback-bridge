@@ -11,7 +11,7 @@ services:
         sync: false
       - key: NOVA_ALLOWED_ORIGINS
         value: https://nova-cinema-eduar.eduardochiana25.chatgpt.site
-      - key: NOVA_BRIDGE_CACHE_GB
-        value: 5
+      - key: NOVA_BRIDGE_CACHE_MB
+        value: 1024
       - key: NOVA_BRIDGE_SESSIONS
         value: 0

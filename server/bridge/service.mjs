@@ -9,6 +9,7 @@ import ffmpegStatic from 'ffmpeg-static';
 import {parseRange,videoMime} from '../range.mjs';
 import {BridgeError,sourceRequest,selectVideo,availableQualities,variantPlaylist,masterPlaylist,originalPlayable,BATCH_SEGMENTS,SEGMENT_SECONDS} from './protocol.mjs';
 import {probe,encodeBatch,JobQueue} from './transcoder.mjs';
+import {RollingCache,RollingPieceStore,viewingStream} from './rolling-store.mjs';
 
 const TRACKERS=['udp://tracker.opentrackr.org:1337/announce','udp://open.stealth.si:80/announce','udp://tracker.torrent.eu.org:451/announce'];
 // Approved CC film metadata also supplies its official HTTPS web seed. Ordinary
@@ -30,7 +31,8 @@ export async function createBridge(options={}) {
   if(!secret || secret.length<32)throw new Error('NOVA_BRIDGE_KEY must contain at least 32 characters.');
   const root=path.resolve(options.cachePath || process.env.NOVA_BRIDGE_CACHE || '.nova-bridge-cache');
   await mkdir(root,{recursive:true});
-  const maxBytes=bounded(options.maxBytes ?? process.env.NOVA_BRIDGE_CACHE_GB,20,1,1000)*1024**3;
+  const cacheBytes=options.cacheBytes ?? bounded(process.env.NOVA_BRIDGE_CACHE_MB,1024,64,64000)*1024**2;
+  const pieceCache=new RollingCache(path.join(root,'pieces'),cacheBytes);
   // Zero removes the fixed session-count cap. Actual memory/disk and converter
   // capacity are still enforced; unlimited compute is not implied.
   const configuredSessions=bounded(options.maxSessions ?? process.env.NOVA_BRIDGE_SESSIONS,0,0,10000),maxSessions=configuredSessions || Infinity;
@@ -43,7 +45,7 @@ export async function createBridge(options={}) {
   client.on('error',()=>{for(const s of sessions.values())s.error='The torrent network stopped. Reconnect to another source.';});
   let closing=false;
   function memoryAvailable(){if(process.memoryUsage().rss>maxRss || (process.availableMemory?.() ?? Infinity)<64*1024**2)throw new BridgeError('The bridge is busy. Retry when memory becomes available.',503);}
-  async function quota(extra=0){const info=await statfs(root);if(Number(info.bavail)*Number(info.bsize)<512*1024**2+extra)throw new BridgeError('The bridge has insufficient free disk space.',503);const total=[...torrents.values()].reduce((n,s)=>n+(s.torrent?.downloaded || 0),0)+[...sessions.values()].reduce((n,s)=>n+s.segmentBytes,0);if(total+extra>maxBytes)throw new BridgeError('The bridge cache is full. Retry after an inactive stream expires.',503);}
+  async function quota(extra=0){const info=await statfs(root);if(Number(info.bavail)*Number(info.bsize)<512*1024**2+extra)throw new BridgeError('The bridge has insufficient free disk space.',503);}
   async function getTorrent(hash){
     const existing=torrents.get(hash);if(existing){existing.used=Date.now();return existing.promise;}
     memoryAvailable();if(torrents.size>=maxSessions)throw new BridgeError('All torrent slots are in use. Retry shortly.',503);
@@ -54,7 +56,7 @@ export async function createBridge(options={}) {
     const state={used:Date.now(),torrent:null,promise:null,probes:new Map()};torrents.set(hash,state);
     state.promise=new Promise((resolve,reject)=>{
       const magnet=`magnet:?xt=urn:btih:${hash}&${TRACKERS.map(t=>'tr='+encodeURIComponent(t)).join('&')}`;
-      const t=client.add(OPEN_TORRENTS[hash] || magnet,{path:path.join(root,'torrents'),addUID:true,deselect:true,storeCacheSlots:8,destroyStoreOnDestroy:true},t=>{clearTimeout(timer);if(t.infoHash!==hash){reject(new BridgeError('The approved source metadata changed.',502));return;}if(t.files.length>10000){reject(new BridgeError('This torrent has too many files.',413));return;}t.deselect(0,t.pieces.length-1,0);for(const f of t.files)f.deselect();state.torrent=t;resolve(t);});
+      const t=client.add(OPEN_TORRENTS[hash] || magnet,{path:path.join(root,'torrents'),addUID:true,deselect:true,store:RollingPieceStore,storeOpts:{pool:pieceCache},storeCacheSlots:0,destroyStoreOnDestroy:true},t=>{clearTimeout(timer);if(t.infoHash!==hash){reject(new BridgeError('The approved source metadata changed.',502));return;}if(t.files.length>10000){reject(new BridgeError('This torrent has too many files.',413));return;}t.deselect(0,t.pieces.length-1,0);for(const f of t.files)f.deselect();state.torrent=t;resolve(t);});
       const timer=setTimeout(()=>{reject(new BridgeError('No torrent peers supplied metadata. Try a better-seeded release.',504));},options.metadataTimeout || 90000);
       t.once('error',()=>{clearTimeout(timer);reject(new BridgeError('The torrent source could not be opened.',502));});
     }).catch(async e=>{torrents.delete(hash);await client.remove(hash,{destroyStore:true}).catch(()=>{});throw e;});
@@ -68,7 +70,7 @@ export async function createBridge(options={}) {
     const start=range?.start ?? 0,end=range?.end ?? s.file.length-1,headers={'Content-Type':videoMime(s.file.name),'Content-Length':end-start+1,'Accept-Ranges':'bytes'};
     if(range)headers['Content-Range']=`bytes ${start}-${end}/${s.file.length}`;
     res.writeHead(range?206:200,headers);if(req.method==='HEAD'){res.end();return;}
-    const stream=s.file.createReadStream({start,end});stream.once('error',()=>res.destroy());res.once('close',()=>stream.destroy());stream.pipe(res);
+    const stream=viewingStream(s.file,{start,end});s.readers.add(stream);stream.once('error',()=>res.destroy());res.once('close',()=>{s.readers.delete(stream);stream.destroy();});stream.pipe(res);
     res.setTimeout(180000,()=>{stream.destroy();res.destroy();});
   });
   await new Promise(resolve=>raw.listen(0,'127.0.0.1',resolve));
@@ -89,10 +91,10 @@ export async function createBridge(options={}) {
     if(!/^[a-f0-9]{64}$/.test(owner))throw new BridgeError('Missing trusted viewer identifier.',403);
     memoryAvailable();if(sessions.size>=maxSessions)throw new BridgeError('The bridge has reached its configured playback capacity.',429);
     // Reserve before awaiting metadata, so parallel requests cannot evade limits.
-    const s={id:randomBytes(16).toString('hex'),token:randomBytes(24).toString('hex'),rawToken:randomBytes(24).toString('hex'),owner,infoHash:request.infoHash,used:Date.now(),expires:Date.now()+ttlMs,file:null,info:null,segmentBytes:0,batches:new Map(),children:new Set(),readers:new Set(),error:'',disposing:false};
+    const s={id:randomBytes(16).toString('hex'),token:randomBytes(24).toString('hex'),rawToken:randomBytes(24).toString('hex'),owner,infoHash:request.infoHash,used:Date.now(),expires:Date.now()+ttlMs,file:null,info:null,segmentBytes:0,batches:new Map(),completedBatches:new Map(),segmentReaders:new Map(),children:new Set(),readers:new Set(),error:'',disposing:false};
     sessions.set(s.id,s);
     try {
-      const t=await getTorrent(request.infoHash),chosen=selectVideo(t.files,request,maxBytes);
+      const t=await getTorrent(request.infoHash),chosen=selectVideo(t.files,request);
       s.file=chosen.file;
       s.input=`http://127.0.0.1:${rawPort}/raw/${s.id}/${s.rawToken}`;
       const state=torrents.get(request.infoHash);
@@ -116,7 +118,13 @@ export async function createBridge(options={}) {
       if(s.disposing)throw new BridgeError('This stream has closed.',410);
       await quota(32*1024**2);
       await encodeBatch({ffmpeg,input:s.input,directory,batch,quality,audio,duration:s.info.duration,threads:bounded(process.env.NOVA_BRIDGE_THREADS,2,1,8),preset:process.env.NOVA_BRIDGE_PRESET || 'veryfast',onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
-      for(let i=batch*BATCH_SEGMENTS;i<(batch+1)*BATCH_SEGMENTS && i*SEGMENT_SECONDS<s.info.duration;i++)s.segmentBytes+=(await stat(path.join(directory,`segment-${i}.ts`))).size;
+      let size=0;for(let i=batch*BATCH_SEGMENTS;i<(batch+1)*BATCH_SEGMENTS && i*SEGMENT_SECONDS<s.info.duration;i++)size+=(await stat(path.join(directory,`segment-${i}.ts`))).size;
+      s.segmentBytes+=size;s.completedBatches.set(key,{directory,batch,size,used:Date.now(),readers:0});
+      for(const [old,entry] of [...s.completedBatches].sort((a,b)=>a[1].used-b[1].used)){
+        if(s.completedBatches.size<=3)break;if(old===key || s.segmentReaders.get(old))continue;
+        for(let i=entry.batch*BATCH_SEGMENTS;i<(entry.batch+1)*BATCH_SEGMENTS;i++)await rm(path.join(entry.directory,`segment-${i}.ts`),{force:true});
+        s.segmentBytes-=entry.size;s.completedBatches.delete(old);s.batches.delete(old);
+      }
     }).catch(e=>{s.batches.delete(key);throw e;});
     s.batches.set(key,promise);return promise;
   }
@@ -168,7 +176,7 @@ export async function createBridge(options={}) {
         const headers={'Content-Type':'video/mp4','Content-Length':end-start+1,'Accept-Ranges':'bytes','Cache-Control':'private, no-store'};
         if(range)headers['Content-Range']=`bytes ${start}-${end}/${s.file.length}`;
         res.writeHead(range?206:200,headers);if(req.method==='HEAD'){res.end();return;}
-        const stream=s.file.createReadStream({start,end});s.readers.add(stream);
+        const stream=viewingStream(s.file,{start,end});s.readers.add(stream);
         const quotaTimer=setInterval(()=>{s.used=Date.now();quota().catch(()=>{stream.destroy();res.destroy();});},5000);quotaTimer.unref();
         const clean=()=>{clearInterval(quotaTimer);s.readers.delete(stream);stream.destroy();};
         stream.once('error',()=>res.destroy());res.once('close',clean);res.setTimeout(180000,()=>res.destroy());stream.pipe(res);return;
@@ -183,6 +191,10 @@ export async function createBridge(options={}) {
         res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});res.end(req.method==='HEAD'?undefined:variantPlaylist(s.info.duration,q,a));return;
       }
       const number=Number(/segment-(\d+)/.exec(match[3])[1]);if(!Number.isSafeInteger(number) || number*SEGMENT_SECONDS>=s.info.duration)throw new BridgeError('Segment not found.',404);
+      const batchKey=`${q}-${a}-${Math.floor(number/BATCH_SEGMENTS)}`;
+      s.segmentReaders.set(batchKey,(s.segmentReaders.get(batchKey)||0)+1);
+      res.once('close',()=>{const remaining=(s.segmentReaders.get(batchKey)||1)-1;if(remaining)s.segmentReaders.set(batchKey,remaining);else s.segmentReaders.delete(batchKey);});
+      const retained=s.completedBatches.get(batchKey);if(retained)retained.used=Date.now();
       const pending=batch(s,number,q,a);
       const filename=path.join(root,'sessions',s.id,`${q}-${a}`,`segment-${number}.ts`),info=await readySegment(filename,pending,()=>res.destroyed || s.disposing);
       if(!info)return;
@@ -193,7 +205,7 @@ export async function createBridge(options={}) {
   });
   server.requestTimeout=300000;server.headersTimeout=30000;
   const timer=setInterval(()=>{for(const s of sessions.values())if(Date.now()-s.used>idleMs || Date.now()>s.expires)dispose(s).catch(()=>{});},30000);timer.unref();
-  return {server,sessions,client,async close(){closing=true;clearInterval(timer);await Promise.allSettled([...sessions.values()].map(dispose));await new Promise(resolve=>client.destroy(resolve));await new Promise(resolve=>raw.close(resolve));if(server.listening)await new Promise(resolve=>{server.close(resolve);server.closeAllConnections();});}};
+  return {server,sessions,client,pieceCache,async close(){closing=true;clearInterval(timer);await Promise.allSettled([...sessions.values()].map(dispose));await new Promise(resolve=>client.destroy(resolve));await new Promise(resolve=>raw.close(resolve));if(server.listening)await new Promise(resolve=>{server.close(resolve);server.closeAllConnections();});}};
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const bridge=await createBridge();const port=bounded(process.env.PORT || process.env.NOVA_BRIDGE_PORT,11570,1024,65535);
