@@ -32,7 +32,7 @@ export async function encodeBatch({ffmpeg,input,directory,batch,quality,audio,du
   await mkdir(directory,{recursive:true});
   const first=batch*BATCH_SEGMENTS,start=first*SEGMENT_SECONDS,length=Math.min(BATCH_SEGMENTS*SEGMENT_SECONDS,duration-start);
   if(length<=0)throw new BridgeError('Segment is outside the video.',404);
-  const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-ss',String(start),'-i',input,'-t',String(length),'-map','0:v:0'];
+  const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','2','-filter_threads','1','-ss',String(start),'-i',input,'-t',String(length),'-map','0:v:0'];
   if(audio>=0)args.push('-map',`0:${audio}`);else args.push('-an');
   args.push('-sn','-dn','-vf',`scale=w=-2:h=${quality},format=yuv420p`,'-c:v','libx264','-preset','veryfast','-crf','22','-profile:v','main','-level:v','4.0','-threads',String(threads),'-force_key_frames',`expr:gte(t,n_forced*${SEGMENT_SECONDS})`,'-sc_threshold','0');
   if(audio>=0)args.push('-c:a','aac','-ac','2','-ar','48000','-b:a','160k');

@@ -11,6 +11,9 @@ import {BridgeError,sourceRequest,selectVideo,availableQualities,variantPlaylist
 import {probe,encodeBatch,JobQueue} from './transcoder.mjs';
 
 const TRACKERS=['udp://tracker.opentrackr.org:1337/announce','udp://open.stealth.si:80/announce','udp://tracker.torrent.eu.org:451/announce'];
+// Approved CC film metadata also supplies its official HTTPS web seed. Ordinary
+// provider hashes still use only DHT/trackers; callers cannot provide a URL.
+const OPEN_TORRENTS={'08ada5a7a6183aae1e09d831df6748d566095a10':'https://webtorrent.io/torrents/sintel.torrent'};
 const PRIVATE_RANGES=['0.0.0.0/8','10.0.0.0/8','127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4'];
 const equal=(a,b)=>{const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length && timingSafeEqual(x,y);};
 const json=(res,status,data)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(data));};
@@ -29,7 +32,7 @@ export async function createBridge(options={}) {
   const ffmpeg=options.ffmpeg || process.env.NOVA_FFMPEG || ffmpegStatic;
   const origins=new Set(options.origins || (process.env.NOVA_ALLOWED_ORIGINS || 'https://nova-cinema-eduar.eduardochiana25.chatgpt.site').split(',').map(s=>s.trim()));
   const sessions=new Map(),torrents=new Map(),jobs=new JobQueue(bounded(options.concurrency ?? process.env.NOVA_BRIDGE_JOBS,2,1,16));
-  const client=options.client || new WebTorrent({maxConns:50,lsd:false,natUpnp:false,natPmp:false,webSeeds:false,blocklist:PRIVATE_RANGES,uploadLimit:512*1024});
+  const client=options.client || new WebTorrent({maxConns:50,lsd:false,natUpnp:false,natPmp:false,webSeeds:true,blocklist:PRIVATE_RANGES,uploadLimit:512*1024});
   client.on('error',()=>{for(const s of sessions.values())s.error='The torrent network stopped. Reconnect to another source.';});
   let closing=false;
   async function quota(extra=0){const info=await statfs(root);if(Number(info.bavail)*Number(info.bsize)<512*1024**2+extra)throw new BridgeError('The bridge has insufficient free disk space.',503);const total=[...torrents.values()].reduce((n,s)=>n+(s.torrent?.downloaded || 0),0)+[...sessions.values()].reduce((n,s)=>n+s.segmentBytes,0);if(total+extra>maxBytes)throw new BridgeError('The bridge cache is full. Retry after an inactive stream expires.',503);}
@@ -40,7 +43,7 @@ export async function createBridge(options={}) {
     const state={used:Date.now(),torrent:null,promise:null};torrents.set(hash,state);
     state.promise=new Promise((resolve,reject)=>{
       const magnet=`magnet:?xt=urn:btih:${hash}&${TRACKERS.map(t=>'tr='+encodeURIComponent(t)).join('&')}`;
-      const t=client.add(magnet,{path:path.join(root,'torrents'),addUID:true,deselect:true,storeCacheSlots:8,destroyStoreOnDestroy:true},t=>{clearTimeout(timer);if(t.files.length>10000){reject(new BridgeError('This torrent has too many files.',413));return;}t.deselect(0,t.pieces.length-1,0);for(const f of t.files)f.deselect();state.torrent=t;resolve(t);});
+      const t=client.add(OPEN_TORRENTS[hash] || magnet,{path:path.join(root,'torrents'),addUID:true,deselect:true,storeCacheSlots:8,destroyStoreOnDestroy:true},t=>{clearTimeout(timer);if(t.infoHash!==hash){reject(new BridgeError('The approved source metadata changed.',502));return;}if(t.files.length>10000){reject(new BridgeError('This torrent has too many files.',413));return;}t.deselect(0,t.pieces.length-1,0);for(const f of t.files)f.deselect();state.torrent=t;resolve(t);});
       const timer=setTimeout(()=>{reject(new BridgeError('No torrent peers supplied metadata. Try a better-seeded release.',504));},options.metadataTimeout || 90000);
       t.once('error',()=>{clearTimeout(timer);reject(new BridgeError('The torrent source could not be opened.',502));});
     }).catch(async e=>{torrents.delete(hash);await client.remove(hash,{destroyStore:true}).catch(()=>{});throw e;});
