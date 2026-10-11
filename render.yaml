@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nova-playback-bridge
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: NOVA_BRIDGE_KEY
+        sync: false
+      - key: NOVA_ALLOWED_ORIGINS
+        value: https://nova-cinema-eduar.eduardochiana25.chatgpt.site
+      - key: NOVA_BRIDGE_CACHE_GB
+        value: 5
