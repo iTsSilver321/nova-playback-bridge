@@ -1,6 +1,6 @@
 export const SEGMENT_SECONDS = 4;
 export const BATCH_SEGMENTS = 4;
-export const QUALITY_HEIGHTS = [480, 720, 1080];
+export const QUALITY_HEIGHTS = [480, 720, 1080, 1440, 2160];
 export class BridgeError extends Error {
   constructor(message, status = 400) { super(message); this.status = status; }
 }
@@ -27,7 +27,7 @@ export function selectVideo(files, request, maxBytes) {
   return chosen;
 }
 export function availableQualities(height) {
-  const top=Math.min(1080,Math.max(2,Math.floor(height/2)*2));
+  const top=Math.max(2,Math.floor(height/2)*2);
   return [...new Set([...QUALITY_HEIGHTS.filter(h=>h<=top),top])].sort((a,b)=>a-b);
 }
 export function variantPlaylist(duration, quality, audio) {
@@ -43,8 +43,16 @@ export function variantPlaylist(duration, quality, audio) {
 export function masterPlaylist(qualities,audio,width,height) {
   const rows=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-INDEPENDENT-SEGMENTS'];
   for(const q of qualities) {
-    const w=Math.max(2,Math.floor(width*q/height/2)*2),bandwidth=q>=1080?6000000:q>=720?3200000:1500000;
+    const w=Math.max(2,Math.floor(width*q/height/2)*2),bandwidth=q>=2160?24000000:q>=1440?12000000:q>=1080?6000000:q>=720?3200000:1500000;
     rows.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${w}x${q}`,`index.m3u8?q=${q}&a=${audio}`);
   }
   return rows.concat('').join('\n');
+}
+export function originalPlayable(file,info){
+  if(!/\.(mp4|m4v)$/i.test(file.name))return false;
+  const video=info.codec==='h264' && /^(yuv420p|yuvj420p)$/.test(info.pixelFormat || '') || info.codec==='hevc' && info.codecTag==='hvc1' && /^(yuv420p|yuv420p10le)$/.test(info.pixelFormat || '');
+  // The unchanged file plays its default audio stream. Other languages remain
+  // available through conversion, rather than silently playing the wrong track.
+  const defaultAudio=info.audio.find(a=>a.default) || info.audio[0];
+  return video && (!defaultAudio || defaultAudio.codec==='aac');
 }

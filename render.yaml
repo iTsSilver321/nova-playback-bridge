@@ -13,3 +13,5 @@ services:
         value: https://nova-cinema-eduar.eduardochiana25.chatgpt.site
       - key: NOVA_BRIDGE_CACHE_GB
         value: 5
+      - key: NOVA_BRIDGE_SESSIONS
+        value: 0

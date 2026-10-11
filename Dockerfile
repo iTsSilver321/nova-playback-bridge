@@ -7,6 +7,6 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY server ./server
 RUN mkdir /cache && chown node:node /cache
 USER node
-ENV NOVA_BRIDGE_BIND=0.0.0.0 NOVA_BRIDGE_CACHE=/cache NOVA_BRIDGE_JOBS=1 NOVA_BRIDGE_SESSIONS=2
+ENV NOVA_BRIDGE_BIND=0.0.0.0 NOVA_BRIDGE_CACHE=/cache NOVA_BRIDGE_JOBS=1 NOVA_BRIDGE_SESSIONS=0
 EXPOSE 10000
 CMD ["node","server/bridge/service.mjs"]
