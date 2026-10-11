@@ -16,7 +16,7 @@ const TRACKERS=['udp://tracker.opentrackr.org:1337/announce','udp://open.stealth
 const OPEN_TORRENTS={
   '08ada5a7a6183aae1e09d831df6748d566095a10':'https://webtorrent.io/torrents/sintel.torrent',
   // Independently authored CC0 3840x2160 diagnostic clip for hosted verification.
-  '8223c04e2bdf0f9f81f19bf47009f6fa1326b928':'https://nova-cinema-eduar.eduardochiana25.chatgpt.site/qa/NOVA-4K.torrent'
+  '8223c04e2bdf0f9f81f19bf47009f6fa1326b928':'https://raw.githubusercontent.com/iTsSilver321/nova-playback-bridge/main/fixtures/NOVA-4K.torrent'
 };
 const PRIVATE_RANGES=['0.0.0.0/8','10.0.0.0/8','127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4'];
 const equal=(a,b)=>{const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length && timingSafeEqual(x,y);};
