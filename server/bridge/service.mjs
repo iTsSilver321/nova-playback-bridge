@@ -40,6 +40,9 @@ export async function createBridge(options={}) {
     const existing=torrents.get(hash);if(existing){existing.used=Date.now();return existing.promise;}
     if(torrents.size>=maxSessions)throw new BridgeError('All torrent slots are in use. Retry shortly.',503);
     await quota();
+    // Another metadata request may have acquired this hash during the disk check.
+    if(torrents.has(hash))return torrents.get(hash).promise;
+    if(torrents.size>=maxSessions)throw new BridgeError('All torrent slots are in use. Retry shortly.',503);
     const state={used:Date.now(),torrent:null,promise:null};torrents.set(hash,state);
     state.promise=new Promise((resolve,reject)=>{
       const magnet=`magnet:?xt=urn:btih:${hash}&${TRACKERS.map(t=>'tr='+encodeURIComponent(t)).join('&')}`;
@@ -98,7 +101,7 @@ export async function createBridge(options={}) {
     const promise=jobs.run(async()=>{
       if(s.disposing)throw new BridgeError('This stream has closed.',410);
       await quota(32*1024**2);
-      await encodeBatch({ffmpeg,input:s.input,directory,batch,quality,audio,duration:s.info.duration,onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
+      await encodeBatch({ffmpeg,input:s.input,directory,batch,quality,audio,duration:s.info.duration,threads:bounded(process.env.NOVA_BRIDGE_THREADS,2,1,8),onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
       for(let i=batch*BATCH_SEGMENTS;i<(batch+1)*BATCH_SEGMENTS && i*SEGMENT_SECONDS<s.info.duration;i++)s.segmentBytes+=(await stat(path.join(directory,`segment-${i}.ts`))).size;
     }).catch(e=>{s.batches.delete(key);throw e;});
     s.batches.set(key,promise);return promise;
