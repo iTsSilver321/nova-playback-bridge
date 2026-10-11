@@ -2,6 +2,7 @@ import {spawn} from 'node:child_process';
 import {mkdir,stat,open,writeFile,rename} from 'node:fs/promises';
 import path from 'node:path';
 import {BridgeError,SEGMENT_SECONDS,BATCH_SEGMENTS} from './protocol.mjs';
+import {videoTrack,fragmentVideoTime} from './mp4-fragments.mjs';
 
 export async function probe(input,ffmpeg,timeout=90000) {
   return new Promise((resolve,reject)=>{
@@ -23,12 +24,25 @@ export async function probe(input,ffmpeg,timeout=90000) {
 }
 export async function remuxSegment({ffmpeg,input,directory,index,start,duration,codec,audio,audioCopy,onChild,timeout=90000}){
   await mkdir(directory,{recursive:true});const temporary=path.join(directory,`copy-${index}.tmp.mp4`);
-  const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','1','-ss',String(start),'-i',input,'-t',String(duration),'-map','0:v:0','-c:v','copy','-tag:v',codec==='hevc'?'hvc1':'avc1','-sn','-dn'];
+  const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','1','-analyzeduration','500000','-probesize','524288','-seek2any','1','-ss',String(start),'-i',input,'-t',String(duration),'-map','0:v:0','-c:v','copy','-tag:v',codec==='hevc'?'hvc1':'avc1','-sn','-dn'];
   if(audio<0)args.push('-an');else{args.push('-map',`0:${audio}`,'-c:a',audioCopy?'copy':'aac');if(!audioCopy)args.push('-profile:a','aac_low','-ac','2','-ar','48000','-b:a','160k','-threads:a','1');}
   args.push('-avoid_negative_ts','make_zero','-movflags','frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets','-f','mp4',temporary);
   await new Promise((resolve,reject)=>{const child=spawn(ffmpeg,args,{windowsHide:true,stdio:['ignore','ignore','pipe']});onChild?.(child);const timer=setTimeout(()=>child.kill(),timeout);child.once('error',()=>{clearTimeout(timer);reject(new BridgeError('The video packager could not start.',503));});child.once('close',code=>{clearTimeout(timer);onChild?.(null);code===0?resolve():reject(new BridgeError('Video packaging stalled. Try another source.',502));});});
-  const file=await open(temporary,'r');let position=0,split;
-  try{const bytes=Buffer.alloc(16);for(let count=0;count<32;count++){const r=await file.read(bytes,0,16,position);if(r.bytesRead<8)break;const type=bytes.toString('ascii',4,8),size=bytes.readUInt32BE(0)===1?Number(bytes.readBigUInt64BE(8)):bytes.readUInt32BE(0);if(type==='moof'){split=position;break;}if(size<8 || !Number.isSafeInteger(size) || position+size>1024**2)break;position+=size;}if(!split)throw new BridgeError('The source has no valid MP4 fragment.',422);const init=Buffer.alloc(split);await file.read(init,0,split,0);await writeFile(path.join(directory,`copy-init-${index}.tmp`),init);}finally{await file.close();}
+  const file=await open(temporary,'r+');let position=0,split,track,first;
+  try{
+    const length=(await file.stat()).size,bytes=Buffer.alloc(16);
+    while(position+8<=length){
+      const r=await file.read(bytes,0,16,position);if(r.bytesRead<8)break;const type=bytes.toString('ascii',4,8),size=bytes.readUInt32BE(0)===1?Number(bytes.readBigUInt64BE(8)):bytes.readUInt32BE(0);
+      if(size<8||!Number.isSafeInteger(size)||position+size>length)throw new BridgeError('Invalid video fragment.',422);
+      if(type==='moof'){
+        if(!split){split=position;if(split>1024**2)throw new BridgeError('Oversized video initialization.',422);const init=Buffer.alloc(split);await file.read(init,0,split,0);track=videoTrack(init);await writeFile(path.join(directory,`copy-init-${index}.tmp`),init);}
+        if(size>1024**2)throw new BridgeError('Oversized fragment metadata.',422);const fragment=Buffer.alloc(size);await file.read(fragment,0,size,position);const timing=fragmentVideoTime(fragment,track);
+        if(timing){if(first===undefined){if(!timing.keyframe)throw new BridgeError('The source did not seek to a keyframe.',422);first=timing.pts;}else if(timing.pts-first>=duration-0.01){await file.truncate(position);break;}}
+      }
+      position+=size;
+    }
+    if(!split||first===undefined)throw new BridgeError('The source has no valid MP4 fragment.',422);
+  }finally{await file.close();}
   // Serve the media resource through a virtual byte view after its init section.
   // This avoids copying the potentially large mdat again.
   await rename(temporary,path.join(directory,`copy-segment-${index}.m4s`));await rename(path.join(directory,`copy-init-${index}.tmp`),path.join(directory,`copy-init-${index}.mp4`));
