@@ -101,10 +101,23 @@ export async function createBridge(options={}) {
     const promise=jobs.run(async()=>{
       if(s.disposing)throw new BridgeError('This stream has closed.',410);
       await quota(32*1024**2);
-      await encodeBatch({ffmpeg,input:s.input,directory,batch,quality,audio,duration:s.info.duration,threads:bounded(process.env.NOVA_BRIDGE_THREADS,2,1,8),onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
+      await encodeBatch({ffmpeg,input:s.input,directory,batch,quality,audio,duration:s.info.duration,threads:bounded(process.env.NOVA_BRIDGE_THREADS,2,1,8),preset:process.env.NOVA_BRIDGE_PRESET || 'veryfast',onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
       for(let i=batch*BATCH_SEGMENTS;i<(batch+1)*BATCH_SEGMENTS && i*SEGMENT_SECONDS<s.info.duration;i++)s.segmentBytes+=(await stat(path.join(directory,`segment-${i}.ts`))).size;
     }).catch(e=>{s.batches.delete(key);throw e;});
     s.batches.set(key,promise);return promise;
+  }
+  // FFmpeg atomically renames each completed segment. Serve that segment as soon
+  // as it is ready instead of waiting for the remaining batch to finish.
+  async function readySegment(filename,pending,closed){
+    let finished=false,failure;
+    pending.then(()=>{finished=true;},e=>{failure=e;finished=true;});
+    for(;;){
+      if(closed())return null;
+      try{const info=await stat(filename);if(info.size>0)return info;}catch(e){if(e.code!=='ENOENT')throw e;}
+      if(failure)throw failure;
+      if(finished)throw new BridgeError('This source did not produce a playable segment.',502);
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
   }
   const server=http.createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
@@ -134,9 +147,9 @@ export async function createBridge(options={}) {
         res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});res.end(req.method==='HEAD'?undefined:variantPlaylist(s.info.duration,q,a));return;
       }
       const number=Number(/segment-(\d+)/.exec(match[3])[1]);if(!Number.isSafeInteger(number) || number*SEGMENT_SECONDS>=s.info.duration)throw new BridgeError('Segment not found.',404);
-      await batch(s,number,q,a);
-      if(res.destroyed)return;
-      const filename=path.join(root,'sessions',s.id,`${q}-${a}`,`segment-${number}.ts`),info=await stat(filename);
+      const pending=batch(s,number,q,a);
+      const filename=path.join(root,'sessions',s.id,`${q}-${a}`,`segment-${number}.ts`),info=await readySegment(filename,pending,()=>res.destroyed || s.disposing);
+      if(!info)return;
       res.writeHead(200,{'Content-Type':'video/mp2t','Content-Length':info.size,'Cache-Control':'private, max-age=120'});
       if(req.method==='HEAD'){res.end();return;}
       const stream=createReadStream(filename);stream.once('error',()=>res.destroy());res.once('close',()=>stream.destroy());stream.pipe(res);

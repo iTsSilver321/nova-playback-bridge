@@ -28,13 +28,13 @@ export class JobQueue {
   }
   drain(){while(this.running<this.concurrency && this.pending.length){const item=this.pending.shift();this.running++;Promise.resolve().then(item.work).then(item.resolve,item.reject).finally(()=>{this.running--;this.drain();});}}
 }
-export async function encodeBatch({ffmpeg,input,directory,batch,quality,audio,duration,threads=2,timeout=180000,onChild}) {
+export async function encodeBatch({ffmpeg,input,directory,batch,quality,audio,duration,threads=2,preset='veryfast',timeout=180000,onChild}) {
   await mkdir(directory,{recursive:true});
   const first=batch*BATCH_SEGMENTS,start=first*SEGMENT_SECONDS,length=Math.min(BATCH_SEGMENTS*SEGMENT_SECONDS,duration-start);
   if(length<=0)throw new BridgeError('Segment is outside the video.',404);
   const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','2','-filter_threads','1','-ss',String(start),'-i',input,'-t',String(length),'-map','0:v:0'];
   if(audio>=0)args.push('-map',`0:${audio}`);else args.push('-an');
-  args.push('-sn','-dn','-vf',`scale=w=-2:h=${quality},format=yuv420p`,'-c:v','libx264','-preset','veryfast','-crf','22','-profile:v','main','-level:v','4.0','-threads',String(threads),'-force_key_frames',`expr:gte(t,n_forced*${SEGMENT_SECONDS})`,'-sc_threshold','0');
+  args.push('-sn','-dn','-vf',`scale=w=-2:h=${quality},format=yuv420p`,'-c:v','libx264','-preset',['ultrafast','superfast','veryfast'].includes(preset)?preset:'veryfast','-crf','22','-profile:v','main','-level:v','4.0','-threads',String(threads),'-force_key_frames',`expr:gte(t,n_forced*${SEGMENT_SECONDS})`,'-sc_threshold','0');
   if(audio>=0)args.push('-c:a','aac','-ac','2','-ar','48000','-b:a','160k');
   args.push('-f','hls','-hls_time',String(SEGMENT_SECONDS),'-hls_list_size','0','-hls_flags','independent_segments+temp_file','-start_number',String(first),'-hls_segment_filename',path.join(directory,'segment-%d.ts'),path.join(directory,`batch-${batch}.m3u8`));
   await new Promise((resolve,reject)=>{
