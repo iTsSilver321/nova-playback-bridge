@@ -118,9 +118,9 @@ export async function createBridge(options={}) {
   async function copied(s,index,audio){
     const key=`${audio}-${index}`;if(s.copies.has(key)){s.copies.get(key).used=Date.now();return s.copies.get(key).promise;}
     const plan=[];
-    for(let n=index;n<Math.min(index+4,s.info.copy.segments.length);n++){const timing=s.info.copy.segments[n],k=`${audio}-${n}`;if(s.copies.has(k)||(n>index && timing.start+timing.duration-s.info.copy.segments[index].start>16))break;const entry={used:Date.now(),promise:null,info:null,resolve:null,reject:null};entry.promise=new Promise((resolve,reject)=>{entry.resolve=resolve;entry.reject=reject;});entry.promise.catch(()=>{});s.copies.set(k,entry);plan.push({index:n,...timing});}
+    for(let n=index;n<Math.min(index+4,s.info.copy.segments.length);n++){const timing=s.info.copy.segments[n],k=`${audio}-${n}`;if(s.copies.has(k)||(n>index && timing.start+timing.duration-s.info.copy.segments[index].start>60))break;const entry={used:Date.now(),promise:null,info:null,resolve:null,reject:null};entry.promise=new Promise((resolve,reject)=>{entry.resolve=resolve;entry.reject=reject;});entry.promise.catch(()=>{});s.copies.set(k,entry);plan.push({index:n,...timing});}
     const directory=path.join(root,'sessions',s.id,`copy-${audio}`);
-    const pending=jobs.run(async()=>{if(s.disposing)throw new BridgeError('This stream has closed.',410);await quota(32*1024**2);const track=s.info.audio.find(a=>a.id===audio);await remuxBatch({ffmpeg,input:s.input,directory,segments:plan,codec:s.info.codec,audio,audioCopy:track?.codec==='aac' && /aac \(LC\)/i.test(track.name),onSegment:(n,info)=>{const e=s.copies.get(`${audio}-${n}`);e.info=info;e.resolve(info);},onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
+    const pending=jobs.run(async()=>{if(s.disposing)throw new BridgeError('This stream has closed.',410);await quota(Math.max(32*1024**2,s.file.length/s.info.duration*(plan.at(-1).start+plan.at(-1).duration-plan[0].start)*2));const track=s.info.audio.find(a=>a.id===audio);await remuxBatch({ffmpeg,input:s.input,directory,segments:plan,codec:s.info.codec,audio,audioCopy:track?.codec==='aac' && /aac \(LC\)/i.test(track.name),onSegment:(n,info)=>{const e=s.copies.get(`${audio}-${n}`);e.info=info;e.resolve(info);},onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});
       for(const [old,e] of [...s.copies].sort((a,b)=>a[1].used-b[1].used)){if(s.copies.size<=12)break;if(old===key || !e.info || s.copyReaders.get(old))continue;const divider=old.lastIndexOf('-'),a=old.slice(0,divider),n=old.slice(divider+1);await rm(path.join(root,'sessions',s.id,`copy-${a}`,`copy-init-${n}.mp4`),{force:true});await rm(path.join(root,'sessions',s.id,`copy-${a}`,`copy-segment-${n}.m4s`),{force:true});s.copies.delete(old);}
     }).catch(e=>{for(const part of plan){const k=`${audio}-${part.index}`,entry=s.copies.get(k);if(entry && !entry.info){entry.reject(e);s.copies.delete(k);}}}).finally(()=>s.copyBatches.delete(pending));s.copyBatches.add(pending);return s.copies.get(key).promise;
   }
@@ -163,7 +163,7 @@ export async function createBridge(options={}) {
     try {
       if(closing)throw new BridgeError('The bridge is shutting down.',503);
       const url=new URL(req.url,'http://bridge.invalid');
-      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1,version:'4.4.3',warm:warm.state});return;}
+      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1,version:'4.4.4',warm:warm.state});return;}
       if(url.pathname==='/v1/sessions' && req.method==='POST'){
         if(!equal(req.headers.authorization,`Bearer ${secret}`))throw new BridgeError('Not authorized.',401);
         json(res,200,await start(await readBody(req)));return;

@@ -51,7 +51,7 @@ export async function remuxSegment({ffmpeg,input,directory,index,start,duration,
   const size=(await stat(path.join(directory,`copy-segment-${index}.m4s`))).size;
   return {offset:split,length:size-split,size};
 }
-export async function remuxBatch({ffmpeg,input,directory,segments,codec,audio,audioCopy,onChild,onSegment,timeout=90000}){
+export async function remuxBatch({ffmpeg,input,directory,segments,codec,audio,audioCopy,onChild,onSegment,timeout=180000}){
   await mkdir(directory,{recursive:true});const start=segments[0].start,end=segments.at(-1).start+segments.at(-1).duration,temporary=path.join(directory,`batch-copy-${segments[0].index}.tmp.mp4`);
   const args=['-hide_banner','-loglevel','error','-nostdin','-y','-protocol_whitelist','file,http,tcp,crypto','-threads','1','-analyzeduration','500000','-probesize','524288','-seek2any','1','-ss',String(start),'-i',input,'-t',String(end-start),'-map','0:v:0','-c:v','copy','-tag:v',codec==='hevc'?'hvc1':'avc1','-sn','-dn'];
   if(audio<0)args.push('-an');else{args.push('-map',`0:${audio}`,'-c:a',audioCopy?'copy':'aac');if(!audioCopy)args.push('-profile:a','aac_low','-ac','2','-ar','48000','-b:a','160k','-threads:a','1');}
