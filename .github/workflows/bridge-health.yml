@@ -16,17 +16,21 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
-          import json, time, urllib.request
+          import json, time, urllib.request, os
           url = 'https://nova-playback-bridge.onrender.com/health'
           for attempt in range(8):
               try:
                   with urllib.request.urlopen(url, timeout=15) as response:
                       result = json.load(response)
                   assert result.get('status') == 'ok' and result.get('protocol') == 1
-                  print('NOVA playback bridge is healthy; warm check completed.')
+                  print('NOVA playback bridge is healthy; warm check completed. Version: '+str(result.get('version')))
+                  with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+                      summary.write('Health check passed at '+time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime())+'. Version '+str(result.get('version'))+'; boot '+str(result.get('bootId','unavailable'))+'.\nScheduling delay is not evidence of an outage.\n')
                   break
               except Exception:
                   if attempt == 7:
+                      with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+                          summary.write('NOVA did not answer eight checks during this run. Check Render for an outage, suspension or exhausted quota. No paid upgrade was requested.\n')
                       raise SystemExit('NOVA playback bridge did not become ready.')
                   time.sleep(8)
           PY

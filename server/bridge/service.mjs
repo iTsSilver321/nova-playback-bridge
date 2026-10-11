@@ -928,6 +928,7 @@ export async function createBridge(options = {}) {
         const disk = await statfs(root);
         json(res, 200, {
           memoryBytes: process.memoryUsage().rss,
+          diskFreeBytes:Number(disk.bavail)*Number(disk.bsize),
           memoryBudget: maxRss,
           pieceBytes: pieceCache.bytes,
           pieceBudget: cacheBytes,
