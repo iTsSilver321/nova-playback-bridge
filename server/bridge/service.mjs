@@ -162,7 +162,7 @@ export async function createBridge(options={}) {
     try {
       if(closing)throw new BridgeError('The bridge is shutting down.',503);
       const url=new URL(req.url,'http://bridge.invalid');
-      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1,version:'4.4',warm:warm.state});return;}
+      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1,version:'4.4.2',warm:warm.state});return;}
       if(url.pathname==='/v1/sessions' && req.method==='POST'){
         if(!equal(req.headers.authorization,`Bearer ${secret}`))throw new BridgeError('Not authorized.',401);
         json(res,200,await start(await readBody(req)));return;

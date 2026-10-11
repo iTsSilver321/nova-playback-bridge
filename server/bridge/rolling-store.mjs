@@ -1,4 +1,4 @@
-import {mkdir,writeFile,readFile,unlink,rm} from 'node:fs/promises';
+import {mkdir,writeFile,open,unlink,rm} from 'node:fs/promises';
 import path from 'node:path';
 import {Readable} from 'node:stream';
 import {BridgeError} from './protocol.mjs';
@@ -59,9 +59,14 @@ export class RollingPieceStore {
     this.pool.run(async()=>{
       const key=this.key(index),entry=this.pool.entries.get(key);
       if(this.closed || !entry){const error=Error('Torrent piece is not cached.');error.notFound=true;throw error;}
-      const bytes=await readFile(entry.filename);this.pool.entries.delete(key);this.pool.entries.set(key,entry);
-      const start=opts.offset || 0,end=opts.length===undefined?bytes.length:start+opts.length;
-      if(start<0 || end>bytes.length)throw Error('Invalid piece range.');return bytes.subarray(start,end);
+      const start=opts.offset ?? 0,end=opts.length===undefined?entry.bytes:start+opts.length;
+      if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start<0||end<start||end>entry.bytes)throw Error('Invalid piece range.');
+      // Peer uploads usually request 16 KB. A subarray of a full multi-MB
+      // piece retains that entire allocation while the upload is queued.
+      // Read only the requested range so a busy swarm cannot multiply RAM.
+      const bytes=Buffer.allocUnsafeSlow(end-start),file=await open(entry.filename,'r');
+      try{let offset=0;while(offset<bytes.length){const read=await file.read(bytes,offset,bytes.length-offset,start+offset);if(!read.bytesRead)throw Error('Truncated cached piece.');offset+=read.bytesRead;}}finally{await file.close();}
+      this.pool.entries.delete(key);this.pool.entries.set(key,entry);return bytes;
     }).then(bytes=>cb(null,bytes),cb);
   }
   close(cb=()=>{}){this.destroy(cb);}

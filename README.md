@@ -8,6 +8,8 @@ NOVA's Worker creates owned sessions with a server-only shared secret. Playback 
 
 There is no fixed movie-file size ceiling. A shared rolling disk cache retains recently requested, verified torrent pieces. Active read windows are leased against eviction; evicted pieces become missing and are downloaded again when seeking backwards. WebTorrent 3.0.21 is pinned because its piece-state adapter uses internal invalidation alongside the standard lt_donthave extension, with revised bitfield fallback for peers without that extension. Conversion retains the three most recently used completed batches per viewer, and protects batches currently being read. Physical disk and memory remain finite.
 
+Piece reads allocate only the requested byte range, including the small blocks used by peer uploads. Queued uploads do not retain entire multi-megabyte pieces. A regression checks both byte identity and bounded retained allocation for a 16 KB request from a 2 MB piece.
+
 This server does not supply movie licenses, peers, translations or an exhaustive catalog. Use media you have permission to stream. Torrent availability and the host's resources still determine whether a source plays. The software is free and contains no advertising. Hosting has separate resource policies: Render's free plan sleeps, shares compute, has monthly transfer limits, and may suspend high-volume outbound traffic. It cannot provide unlimited public streaming. No paid plan is configured.
 
 ## Deploy
