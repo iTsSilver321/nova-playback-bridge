@@ -504,13 +504,24 @@ export async function createBridge(options = {}) {
         // A compatible MP4 needs no decoder or converter slot to describe it.
         // Unknown, malformed, HDR and other formats still use the existing probe.
         info = (async () => {
-          const direct = await mp4Metadata(s.file);
-          if (direct) return direct;
-          return jobs.run(async () => {
+          const controller = new AbortController();
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          const timer = setTimeout(() => release(), 250);
+          controller.signal.addEventListener("abort", release, { once: true });
+          const direct = mp4Metadata(s.file, { signal: controller.signal }).then(value => {
+            if (value) return value;
+            release();
+            throw new BridgeError("This file needs full media analysis.", 422);
+          });
+          // A slow header read must not add its entire timeout to cold startup.
+          // Start the fallback after a short head start; cancel whichever loses.
+          const full = gate.then(() => jobs.run(async () => {
             const metadata = await probe(
               s.input,
               ffmpeg,
               options.probeTimeout || 90000,
+              controller.signal,
             );
             if (
               !metadata.dolbyVision &&
@@ -525,7 +536,10 @@ export async function createBridge(options = {}) {
               if (codec) metadata.copy = { segments: index.segments, codec };
             }
             return { ...metadata, metadataMethod: "ffmpeg" };
-          });
+          }, controller.signal));
+          try { return await Promise.any([direct, full]); }
+          catch (error) { throw error.errors?.[1] || error; }
+          finally { clearTimeout(timer); controller.abort(); }
         })()
           .catch((e) => {
             state.probes.delete(chosen.index);
@@ -918,7 +932,7 @@ export async function createBridge(options = {}) {
         json(res, 200, {
           status: "ok",
           protocol: 1,
-          version: "4.6.0",
+          version: "4.6.1",
           bootId,
           startedAt,
           warm: warm.state,

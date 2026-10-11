@@ -6,12 +6,15 @@ import path from 'node:path';
 import {BridgeError,SEGMENT_SECONDS,BATCH_SEGMENTS} from './protocol.mjs';
 import {videoTrack,fragmentVideoTime} from './mp4-fragments.mjs';
 
-export async function probe(input,ffmpeg,timeout=90000) {
+export async function probe(input,ffmpeg,timeout=90000,signal) {
   return new Promise((resolve,reject)=>{
+    if(signal?.aborted)return reject(new BridgeError('Video analysis cancelled.',410));
     const child=spawn(ffmpeg,['-hide_banner','-threads','1','-analyzeduration','2000000','-probesize','2000000','-protocol_whitelist','file,http,tcp,crypto','-i',input],{windowsHide:true,stdio:['ignore','ignore','pipe']});
     let output='',settled=false;
-    const done=(error,data)=>{if(settled)return;settled=true;clearTimeout(timer);error?reject(error):resolve(data);};
+    const abort=()=>{child.kill();done(new BridgeError('Video analysis cancelled.',410));};
+    const done=(error,data)=>{if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',abort);error?reject(error):resolve(data);};
     const timer=setTimeout(()=>{child.kill();done(new BridgeError('Video metadata timed out. Try a source with more peers.',504));},timeout);
+    signal?.addEventListener('abort',abort,{once:true});
     child.stderr.on('data',b=>{output=(output+b.toString()).slice(-60000);});
     child.once('error',()=>done(new BridgeError('FFmpeg is unavailable on the bridge.',503)));
     child.once('close',()=>{

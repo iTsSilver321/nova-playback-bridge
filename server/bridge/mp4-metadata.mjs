@@ -200,10 +200,10 @@ export function parseMp4Metadata(bytes) {
   for (const a of audio) a.default = a.id === defaultId;
   return {...video, duration: movie.duration, codec: 'h264', codecTag: 'avc1', pixelFormat: 'yuv420p', hdr: false, dolbyVision: false, audio, metadataMethod: 'mp4-header'};
 }
-export async function mp4Metadata(file, {timeout = 8000} = {}) {
+export async function mp4Metadata(file, {timeout = 8000, signal} = {}) {
   if (!/\.(mp4|m4v)$/i.test(file.name)) return null;
   let reader, total = 0, boxes = 0;
-  const deadline = AbortSignal.timeout(timeout);
+  const deadline = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
   const abort = () => reader?.destroy(Error('MP4 metadata read timed out'));
   deadline.addEventListener('abort', abort);
   const read = async (start, length) => {
