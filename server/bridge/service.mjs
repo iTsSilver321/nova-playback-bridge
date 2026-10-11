@@ -8,8 +8,10 @@ import WebTorrent from 'webtorrent';
 import ffmpegStatic from 'ffmpeg-static';
 import {parseRange,videoMime} from '../range.mjs';
 import {BridgeError,sourceRequest,selectVideo,availableQualities,variantPlaylist,masterPlaylist,originalPlayable,BATCH_SEGMENTS,SEGMENT_SECONDS} from './protocol.mjs';
-import {probe,encodeBatch,JobQueue} from './transcoder.mjs';
+import {probe,encodeBatch,remuxSegment,JobQueue} from './transcoder.mjs';
 import {RollingCache,RollingPieceStore,viewingStream} from './rolling-store.mjs';
+import {matroskaIndex,codecString} from './matroska.mjs';
+import {startWarmWatchdog} from './warm-watchdog.mjs';
 
 const TRACKERS=['udp://tracker.opentrackr.org:1337/announce','udp://open.stealth.si:80/announce','udp://tracker.torrent.eu.org:451/announce'];
 // Approved CC film metadata also supplies its official HTTPS web seed. Ordinary
@@ -17,7 +19,9 @@ const TRACKERS=['udp://tracker.opentrackr.org:1337/announce','udp://open.stealth
 const OPEN_TORRENTS={
   '08ada5a7a6183aae1e09d831df6748d566095a10':'https://webtorrent.io/torrents/sintel.torrent',
   // Independently authored CC0 3840x2160 diagnostic clip for hosted verification.
-  '8223c04e2bdf0f9f81f19bf47009f6fa1326b928':'https://raw.githubusercontent.com/iTsSilver321/nova-playback-bridge/main/fixtures/NOVA-4K.torrent'
+  '8223c04e2bdf0f9f81f19bf47009f6fa1326b928':'https://raw.githubusercontent.com/iTsSilver321/nova-playback-bridge/main/fixtures/NOVA-4K.torrent',
+  'ed9047bca56aafa5cb5b9ef3362b6604c2a9ac32':'https://raw.githubusercontent.com/iTsSilver321/nova-playback-bridge/main/fixtures/NOVA-HD.torrent',
+  '82e4facca52144ebff065413622676bafe3d69b3':'https://raw.githubusercontent.com/iTsSilver321/nova-playback-bridge/main/fixtures/NOVA-HEVC-4K.torrent'
 };
 const PRIVATE_RANGES=['0.0.0.0/8','10.0.0.0/8','127.0.0.0/8','169.254.0.0/16','172.16.0.0/12','192.168.0.0/16','224.0.0.0/4','240.0.0.0/4'];
 const equal=(a,b)=>{const x=Buffer.from(a||''),y=Buffer.from(b||'');return x.length===y.length && timingSafeEqual(x,y);};
@@ -44,6 +48,7 @@ export async function createBridge(options={}) {
   const client=options.client || new WebTorrent({maxConns:50,lsd:false,natUpnp:false,natPmp:false,webSeeds:true,blocklist:PRIVATE_RANGES,uploadLimit:512*1024});
   client.on('error',()=>{for(const s of sessions.values())s.error='The torrent network stopped. Reconnect to another source.';});
   let closing=false;
+  const warm=startWarmWatchdog({url:Number(process.env.NOVA_BRIDGE_SELF_WARM_SECONDS)>0?process.env.RENDER_EXTERNAL_URL:'',intervalMs:bounded(process.env.NOVA_BRIDGE_SELF_WARM_SECONDS,240,60,600)*1000});
   function memoryAvailable(){if(process.memoryUsage().rss>maxRss || (process.availableMemory?.() ?? Infinity)<64*1024**2)throw new BridgeError('The bridge is busy. Retry when memory becomes available.',503);}
   async function quota(extra=0){const info=await statfs(root);if(Number(info.bavail)*Number(info.bsize)<512*1024**2+extra)throw new BridgeError('The bridge has insufficient free disk space.',503);}
   async function getTorrent(hash){
@@ -78,12 +83,12 @@ export async function createBridge(options={}) {
   async function dispose(s){
     if(s.disposing)return;s.disposing=true;
     sessions.delete(s.id);for(const child of s.children)child.kill();for(const reader of s.readers)reader.destroy();
-    await Promise.allSettled([...s.batches.values()]);
+    await Promise.allSettled([...s.batches.values(),...[...s.copies.values()].map(e=>e.promise)]);
     const target=path.resolve(root,'sessions',s.id);
     if(!target.startsWith(root+path.sep))throw new Error('Cache path escaped its root.');
     await rm(target,{recursive:true,force:true});
     if(![...sessions.values()].some(other=>other.infoHash===s.infoHash)){
-      torrents.delete(s.infoHash);await client.remove(s.infoHash,{destroyStore:true}).catch(()=>{});
+      const state=torrents.get(s.infoHash);if(state)state.used=Date.now();
     }
   }
   async function start(value){
@@ -91,7 +96,7 @@ export async function createBridge(options={}) {
     if(!/^[a-f0-9]{64}$/.test(owner))throw new BridgeError('Missing trusted viewer identifier.',403);
     memoryAvailable();if(sessions.size>=maxSessions)throw new BridgeError('The bridge has reached its configured playback capacity.',429);
     // Reserve before awaiting metadata, so parallel requests cannot evade limits.
-    const s={id:randomBytes(16).toString('hex'),token:randomBytes(24).toString('hex'),rawToken:randomBytes(24).toString('hex'),owner,infoHash:request.infoHash,used:Date.now(),expires:Date.now()+ttlMs,file:null,info:null,segmentBytes:0,batches:new Map(),completedBatches:new Map(),segmentReaders:new Map(),children:new Set(),readers:new Set(),error:'',disposing:false};
+    const s={id:randomBytes(16).toString('hex'),token:randomBytes(24).toString('hex'),rawToken:randomBytes(24).toString('hex'),owner,infoHash:request.infoHash,used:Date.now(),expires:Date.now()+ttlMs,file:null,info:null,segmentBytes:0,batches:new Map(),completedBatches:new Map(),segmentReaders:new Map(),copies:new Map(),copyReaders:new Map(),children:new Set(),readers:new Set(),error:'',disposing:false};
     sessions.set(s.id,s);
     try {
       const t=await getTorrent(request.infoHash),chosen=selectVideo(t.files,request);
@@ -99,7 +104,7 @@ export async function createBridge(options={}) {
       s.input=`http://127.0.0.1:${rawPort}/raw/${s.id}/${s.rawToken}`;
       const state=torrents.get(request.infoHash);
       let info=state.probes.get(chosen.index);
-      if(!info){info=jobs.run(()=>probe(s.input,ffmpeg,options.probeTimeout || 90000)).catch(e=>{state.probes.delete(chosen.index);throw e;});state.probes.set(chosen.index,info);}
+      if(!info){info=jobs.run(async()=>{const metadata=await probe(s.input,ffmpeg,options.probeTimeout || 90000);if(!metadata.dolbyVision && ((metadata.codec==='h264' && /^(yuv420p|yuvj420p)$/.test(metadata.pixelFormat)) || (metadata.codec==='hevc' && /^(yuv420p|yuv420p10le)$/.test(metadata.pixelFormat)))){const index=await matroskaIndex(s.file,metadata.duration);const codec=index && codecString(metadata.codec,index.privateData);if(codec)metadata.copy={segments:index.segments,codec};}return metadata;}).catch(e=>{state.probes.delete(chosen.index);throw e;});state.probes.set(chosen.index,info);}
       s.info=await info;
       if(closing || s.disposing)throw new BridgeError('The bridge is shutting down.',503);
       const qualities=availableQualities(s.info.height),audio=s.info.audio[0]?.id ?? -1;
@@ -107,8 +112,16 @@ export async function createBridge(options={}) {
       s.original=originalPlayable(s.file,s.info);
       const prefix=`/v1/media/${s.id}/${s.token}/`;
       const originalAudio=s.info.audio.find(a=>a.default)?.id ?? audio;
-      return {id:s.id,path:prefix+`master.m3u8?a=${audio}`,expires:s.expires,duration:s.info.duration,audio:s.info.audio,qualities,name:s.file.name,...(s.original?{original:{path:prefix+'file.mp4',height:s.info.height,width:s.info.width,codec:s.info.codec,audioId:originalAudio}}:{})};
+      return {id:s.id,path:prefix+`master.m3u8?a=${audio}`,expires:s.expires,duration:s.info.duration,audio:s.info.audio,qualities,name:s.file.name,...(s.info.copy?{copy:{path:prefix+'copy-master.m3u8',height:s.info.height,width:s.info.width,codec:s.info.copy.codec}}:{}),...(s.original?{original:{path:prefix+'file.mp4',height:s.info.height,width:s.info.width,codec:s.info.codec,audioId:originalAudio}}:{})};
     } catch(e){await dispose(s);throw e;}
+  }
+  async function copied(s,index,audio){
+    const key=`${audio}-${index}`;if(s.copies.has(key)){s.copies.get(key).used=Date.now();return s.copies.get(key).promise;}
+    const entry={used:Date.now(),promise:null,info:null};s.copies.set(key,entry);
+    const directory=path.join(root,'sessions',s.id,`copy-${audio}`);
+    entry.promise=jobs.run(async()=>{if(s.disposing)throw new BridgeError('This stream has closed.',410);await quota(32*1024**2);const timing=s.info.copy.segments[index],track=s.info.audio.find(a=>a.id===audio);const info=await remuxSegment({ffmpeg,input:s.input,directory,index,...timing,codec:s.info.codec,audio,audioCopy:track?.codec==='aac' && /aac \(LC\)/i.test(track.name),onChild:child=>{if(child)s.children.add(child);else for(const c of s.children)if(c.exitCode!==null || c.signalCode!==null)s.children.delete(c);}});entry.info=info;
+      for(const [old,e] of [...s.copies].sort((a,b)=>a[1].used-b[1].used)){if(s.copies.size<=12)break;if(old===key || !e.info || s.copyReaders.get(old))continue;const divider=old.lastIndexOf('-'),a=old.slice(0,divider),n=old.slice(divider+1);await rm(path.join(root,'sessions',s.id,`copy-${a}`,`copy-init-${n}.mp4`),{force:true});await rm(path.join(root,'sessions',s.id,`copy-${a}`,`copy-segment-${n}.m4s`),{force:true});s.copies.delete(old);}return info;
+    }).catch(e=>{s.copies.delete(key);throw e;});return entry.promise;
   }
   async function batch(s,number,quality,audio){
     const batch=Math.floor(number/BATCH_SEGMENTS),key=`${quality}-${audio}-${batch}`;
@@ -149,7 +162,7 @@ export async function createBridge(options={}) {
     try {
       if(closing)throw new BridgeError('The bridge is shutting down.',503);
       const url=new URL(req.url,'http://bridge.invalid');
-      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1});return;}
+      if(url.pathname==='/health' && req.method==='GET'){json(res,200,{status:'ok',protocol:1,version:'4.4',warm:warm.state});return;}
       if(url.pathname==='/v1/sessions' && req.method==='POST'){
         if(!equal(req.headers.authorization,`Bearer ${secret}`))throw new BridgeError('Not authorized.',401);
         json(res,200,await start(await readBody(req)));return;
@@ -162,7 +175,7 @@ export async function createBridge(options={}) {
         if(s)dispose(s).catch(()=>{});
         json(res,202,{closed:true});return;
       }
-      const match=/^\/v1\/media\/([a-f0-9]{32})\/([a-f0-9]{48})\/(master\.m3u8|index\.m3u8|file\.mp4|segment-\d+\.ts)$/.exec(url.pathname);
+      const match=/^\/v1\/media\/([a-f0-9]{32})\/([a-f0-9]{48})\/(master\.m3u8|index\.m3u8|file\.mp4|segment-\d+\.ts|copy-master\.m3u8|copy-index\.m3u8|copy-init-\d+\.mp4|copy-segment-\d+\.m4s)$/.exec(url.pathname);
       if(!match || !['GET','HEAD'].includes(req.method))throw new BridgeError('Not found.',404);
       const s=sessions.get(match[1]);if(!s || !equal(match[2],s.token) || !s.info)throw new BridgeError('This stream has expired. Open the source again.',410);
       if(s.expires<Date.now()){await dispose(s);throw new BridgeError('This stream has expired. Open the source again.',410);}
@@ -183,6 +196,18 @@ export async function createBridge(options={}) {
       }
       const a=Number(url.searchParams.get('a') ?? s.info.audio[0]?.id ?? -1),q=Number(url.searchParams.get('q') ?? 720);
       if(!Number.isInteger(a) || (a!==-1 && !s.info.audio.some(track=>track.id===a)))throw new BridgeError('Unknown audio track.');
+      if(match[3].startsWith('copy-')){
+        if(!s.info.copy)throw new BridgeError('This source has no compatible indexed video.',422);
+        if(match[3]==='copy-master.m3u8'){const codecs=s.info.copy.codec+(a>=0?',mp4a.40.2':''),rate=Math.max(256000,Math.ceil(s.file.length*8/s.info.duration*1.35));res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});res.end(req.method==='HEAD'?undefined:`#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-STREAM-INF:BANDWIDTH=${rate},RESOLUTION=${s.info.width}x${s.info.height},CODECS="${codecs}"\ncopy-index.m3u8?a=${a}\n`);return;}
+        if(match[3]==='copy-index.m3u8'){const rows=['#EXTM3U','#EXT-X-VERSION:7',`#EXT-X-TARGETDURATION:${Math.ceil(s.info.copy.segments.reduce((max,p)=>Math.max(max,p.duration),0)+0.25)}`,'#EXT-X-MEDIA-SEQUENCE:0','#EXT-X-PLAYLIST-TYPE:VOD','#EXT-X-INDEPENDENT-SEGMENTS'];s.info.copy.segments.forEach((p,n)=>{if(n)rows.push('#EXT-X-DISCONTINUITY');rows.push(`#EXT-X-MAP:URI="copy-init-${n}.mp4?a=${a}"`,`#EXTINF:${p.duration.toFixed(6)},`,`copy-segment-${n}.m4s?a=${a}`);});rows.push('#EXT-X-ENDLIST','');res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});res.end(req.method==='HEAD'?undefined:rows.join('\n'));return;}
+        const n=Number(/copy-(?:init|segment)-(\d+)/.exec(match[3])[1]);if(!Number.isSafeInteger(n)||!s.info.copy.segments[n])throw new BridgeError('Segment not found.',404);
+        const key=`${a}-${n}`;s.copyReaders.set(key,(s.copyReaders.get(key)||0)+1);res.once('close',()=>{const count=(s.copyReaders.get(key)||1)-1;if(count)s.copyReaders.set(key,count);else s.copyReaders.delete(key);});
+        const info=await copied(s,n,a);if(res.destroyed)return;
+        const init=match[3].startsWith('copy-init'),filename=path.join(root,'sessions',s.id,`copy-${a}`,match[3]),length=init?info.offset:info.length,offset=init?0:info.offset;
+        let range;try{range=parseRange(req.headers.range,length);}catch{res.setHeader('Content-Range',`bytes */${length}`);throw new BridgeError('Invalid byte range.',416);}
+        const start=range?.start??0,end=range?.end??length-1,headers={'Content-Type':'video/mp4','Content-Length':end-start+1,'Accept-Ranges':'bytes','Cache-Control':'private, max-age=120'};if(range)headers['Content-Range']=`bytes ${start}-${end}/${length}`;
+        res.writeHead(range?206:200,headers);if(req.method==='HEAD'){res.end();return;}const reader=createReadStream(filename,{start:offset+start,end:offset+end});s.readers.add(reader);reader.once('error',()=>res.destroy());res.once('close',()=>{s.readers.delete(reader);reader.destroy();});reader.pipe(res);return;
+      }
       if(match[3]==='master.m3u8'){
         const value=masterPlaylist(s.qualities,a,s.info.width,s.info.height);res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl','Cache-Control':'private, no-store'});res.end(req.method==='HEAD'?undefined:value);return;
       }
@@ -204,8 +229,8 @@ export async function createBridge(options={}) {
     } catch(e){options.onError?.(e);if(!res.headersSent)json(res,e instanceof BridgeError?e.status:500,{error:e instanceof BridgeError?e.message:'The playback bridge failed. Try another source.'});else res.destroy();}
   });
   server.requestTimeout=300000;server.headersTimeout=30000;
-  const timer=setInterval(()=>{for(const s of sessions.values())if(Date.now()-s.used>idleMs || Date.now()>s.expires)dispose(s).catch(()=>{});},30000);timer.unref();
-  return {server,sessions,client,pieceCache,async close(){closing=true;clearInterval(timer);await Promise.allSettled([...sessions.values()].map(dispose));await new Promise(resolve=>client.destroy(resolve));await new Promise(resolve=>raw.close(resolve));if(server.listening)await new Promise(resolve=>{server.close(resolve);server.closeAllConnections();});}};
+  const timer=setInterval(()=>{for(const s of sessions.values())if(Date.now()-s.used>idleMs || Date.now()>s.expires)dispose(s).catch(()=>{});for(const [hash,state] of torrents)if(Date.now()-state.used>120000 && ![...sessions.values()].some(s=>s.infoHash===hash)){torrents.delete(hash);client.remove(hash,{destroyStore:true}).catch(()=>{});}},30000);timer.unref();
+  return {server,sessions,client,pieceCache,async close(){closing=true;warm.stop();clearInterval(timer);await Promise.allSettled([...sessions.values()].map(dispose));await new Promise(resolve=>client.destroy(resolve));await new Promise(resolve=>raw.close(resolve));if(server.listening)await new Promise(resolve=>{server.close(resolve);server.closeAllConnections();});}};
 }
 if(process.argv[1] && path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const bridge=await createBridge();const port=bounded(process.env.PORT || process.env.NOVA_BRIDGE_PORT,11570,1024,65535);

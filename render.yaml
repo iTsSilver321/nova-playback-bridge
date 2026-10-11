@@ -15,3 +15,5 @@ services:
         value: 1024
       - key: NOVA_BRIDGE_SESSIONS
         value: 0
+      - key: NOVA_BRIDGE_SELF_WARM_SECONDS
+        value: 240

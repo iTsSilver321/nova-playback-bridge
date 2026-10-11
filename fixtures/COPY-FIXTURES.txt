@@ -1,0 +1,1 @@
+Authored FFmpeg test patterns and generated sine tones, dedicated to CC0/public domain. NOVA-HD.mkv: 1920x1080 H.264/AC3, 24.25 seconds. NOVA-HEVC-4K.mkv: 3840x2160 HEVC Main10/AC3, 6.25 seconds. Diagnostic media only, not catalog films.
