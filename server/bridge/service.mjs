@@ -28,7 +28,7 @@ export async function createBridge(options={}) {
   await mkdir(root,{recursive:true});
   const maxBytes=bounded(options.maxBytes ?? process.env.NOVA_BRIDGE_CACHE_GB,20,1,1000)*1024**3;
   const maxSessions=bounded(options.maxSessions ?? process.env.NOVA_BRIDGE_SESSIONS,4,1,100);
-  const idleMs=options.idleMs ?? 20*60*1000,ttlMs=options.ttlMs ?? 6*60*60*1000;
+  const idleMs=options.idleMs ?? bounded(process.env.NOVA_BRIDGE_IDLE_MINUTES,20,1,120)*60*1000,ttlMs=options.ttlMs ?? 6*60*60*1000;
   const ffmpeg=options.ffmpeg || process.env.NOVA_FFMPEG || ffmpegStatic;
   const origins=new Set(options.origins || (process.env.NOVA_ALLOWED_ORIGINS || 'https://nova-cinema-eduar.eduardochiana25.chatgpt.site').split(',').map(s=>s.trim()));
   const sessions=new Map(),torrents=new Map(),jobs=new JobQueue(bounded(options.concurrency ?? process.env.NOVA_BRIDGE_JOBS,2,1,16));
@@ -131,6 +131,14 @@ export async function createBridge(options={}) {
       if(url.pathname==='/v1/sessions' && req.method==='POST'){
         if(!equal(req.headers.authorization,`Bearer ${secret}`))throw new BridgeError('Not authorized.',401);
         json(res,200,await start(await readBody(req)));return;
+      }
+      const closingSession=/^\/v1\/sessions\/([a-f0-9]{32})\/close$/.exec(url.pathname);
+      if(closingSession && req.method==='POST'){
+        if(!equal(req.headers.authorization,`Bearer ${secret}`))throw new BridgeError('Not authorized.',401);
+        const value=await readBody(req),s=sessions.get(closingSession[1]);
+        if(s && !equal(s.owner,String(value.owner || '')))throw new BridgeError('This stream belongs to another viewer.',403);
+        if(s)dispose(s).catch(()=>{});
+        json(res,202,{closed:true});return;
       }
       const match=/^\/v1\/media\/([a-f0-9]{32})\/([a-f0-9]{48})\/(master\.m3u8|index\.m3u8|segment-\d+\.ts)$/.exec(url.pathname);
       if(!match || !['GET','HEAD'].includes(req.method))throw new BridgeError('Not found.',404);

@@ -44,7 +44,7 @@ export function masterPlaylist(qualities,audio,width,height) {
   const rows=['#EXTM3U','#EXT-X-VERSION:3','#EXT-X-INDEPENDENT-SEGMENTS'];
   for(const q of qualities) {
     const w=Math.max(2,Math.floor(width*q/height/2)*2),bandwidth=q>=1080?6000000:q>=720?3200000:1500000;
-    rows.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${w}x${q},CODECS="avc1.4d0028,mp4a.40.2"`,`index.m3u8?q=${q}&a=${audio}`);
+    rows.push(`#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${w}x${q}`,`index.m3u8?q=${q}&a=${audio}`);
   }
   return rows.concat('').join('\n');
 }
