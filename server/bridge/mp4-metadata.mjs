@@ -202,18 +202,37 @@ export function parseMp4Metadata(bytes) {
 }
 export async function mp4Metadata(file, {timeout = 8000} = {}) {
   if (!/\.(mp4|m4v)$/i.test(file.name)) return null;
-  let reader, total = 0;
+  let reader, total = 0, boxes = 0;
   const deadline = AbortSignal.timeout(timeout);
   const abort = () => reader?.destroy(Error('MP4 metadata read timed out'));
   deadline.addEventListener('abort', abort);
   const read = async (start, length) => {
-    if (deadline.aborted || length <= 0 || total + length > LIMIT + 4096 || start + length > file.length) throw Error('Invalid metadata read');
+    if (deadline.aborted || length <= 0 || total + length > LIMIT + 16384 || start + length > file.length) throw Error('Invalid metadata read');
     total += length; const chunks = []; let received = 0;
     reader = viewingStream(file, {start, end: start + length - 1, signal: deadline});
     for await (const chunk of reader) {received += chunk.length; if (received > length) throw Error('Oversized metadata read'); chunks.push(chunk);}
     reader = null;
     if (received !== length) throw Error('Truncated metadata read');
     return Buffer.concat(chunks, received);
+  };
+  const keep = {moov: ['mvhd', 'trak', 'mvex'], trak: ['tkhd', 'mdia'], mdia: ['mdhd', 'hdlr', 'minf'], minf: ['stbl'], stbl: ['stsd', 'stts']};
+  const compact = async (type, start, end) => {
+    const parts = [];
+    for (let at = start; at < end;) {
+      if (++boxes > 512) throw Error('Too many metadata boxes');
+      const prefix = await read(at, Math.min(16, end - at));
+      const child = box(prefix, 0, end - at);
+      if (type === 'moov' && child.type === 'mvex') throw Error('Fragmented MP4 needs full probing');
+      if (keep[type].includes(child.type)) {
+        const body = keep[child.type]
+          ? await compact(child.type, at + child.start, at + child.end)
+          : await read(at + child.start, child.end - child.start);
+        const header = Buffer.alloc(8); header.writeUInt32BE(body.length + 8); header.write(child.type, 4, 'ascii');
+        parts.push(header, body);
+      }
+      at += child.size;
+    }
+    return Buffer.concat(parts);
   };
   try {
     for (let at = 0, count = 0; at + 8 <= file.length && count < 128; count++) {
@@ -224,7 +243,12 @@ export async function mp4Metadata(file, {timeout = 8000} = {}) {
       if (entry.type === 'moov') {
         const length = entry.end - entry.start;
         if (length > LIMIT) return null;
-        return parseMp4Metadata(await read(at + entry.start, length));
+        // Keep only codec, dimensions, language and sample timing. Large stsz,
+        // stco, ctts and stsc tables remain in the source for native playback.
+        const metadata = length <= 128 * 1024
+          ? await read(at + entry.start, length)
+          : await compact('moov', at + entry.start, at + entry.end);
+        return {...parseMp4Metadata(metadata), metadataReadBytes: total};
       }
       if (entry.type === 'moof') return null;
       at += entry.size;

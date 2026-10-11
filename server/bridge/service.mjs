@@ -606,6 +606,7 @@ export async function createBridge(options = {}) {
         hdr: !!s.info.hdr,
         dolbyVision: !!s.info.dolbyVision,
         metadataMethod: s.info.metadataMethod,
+        metadataReadBytes: s.info.metadataReadBytes,
         ...(s.info.copy
           ? {
               copy: {
